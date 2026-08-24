@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warsh-data"
+version = "0.1.0"
+description = "Build a Warsh recitation dataset: waqf segmentation, manifests, and Hugging Face export."
+requires-python = ">=3.12"
+dependencies = [
+    "recitations-segmenter",
+    "torch",
+    "transformers",
+    "soundfile",
+    "numpy",
+]
+
+[project.optional-dependencies]
+hub = ["datasets", "huggingface_hub"]
+
+[project.scripts]
+warsh-data = "warshdata.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
