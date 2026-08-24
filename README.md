@@ -108,6 +108,16 @@ CPU. Override with `--dtype`. The resolved value is written to
 is wiped when the session ends. Point `-o` at a mounted Drive folder, or push to
 the Hub as soon as a pass finishes.
 
+**Audio is decoded by ffmpeg, not torchaudio.** `recitations_segmenter.read_audio`
+goes through torchaudio's backend API (`list_audio_backends`), which recent
+torchaudio removed -- on a current Colab image it raises `AttributeError` before
+reading a byte. `warshdata.audio.load_wave` shells out to ffmpeg instead, which
+also does the downmix and the resample in one pass. Without ffmpeg it falls back
+to soundfile plus soxr or scipy for the resample.
+
+Source recordings are **22050 Hz**, so resampling to the model's 16 kHz always
+happens -- it is not an edge case.
+
 **The thresholds are a tuning knob, not a constant.** Defaults are 200 ms silence
 floor / 400 ms speech floor / 40 ms padding — above breath noise, but low enough
 to keep short waqf units. The model card's 30/30/30 finds any speech boundary,

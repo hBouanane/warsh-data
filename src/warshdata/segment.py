@@ -17,12 +17,9 @@ from typing import List, Optional, Tuple
 import soundfile as sf
 import torch
 
-from recitations_segmenter import (
-    clean_speech_intervals,
-    read_audio,
-    segment_recitations,
-)
+from recitations_segmenter import clean_speech_intervals, segment_recitations
 
+from .audio import load_wave
 from .manifest import SegmentRecord
 from .sources import Source, segment_id
 
@@ -123,7 +120,7 @@ class Segmenter:
         a run; this layer does not swallow it.
         """
         p = self.params
-        wave = read_audio(str(source.path))
+        wave = load_wave(source.path, SAMPLE_RATE)
 
         outputs = segment_recitations(
             [wave],
