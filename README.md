@@ -124,19 +124,35 @@ Segments stream into parquet shards and upload as each fills, so local disk neve
 grows past one shard. `--resume` reads the *manifest* from the Hub -- a few MB,
 not the corpus -- so a run continues across sessions.
 
-The invariant that makes resume safe:
+**Resume reads the shards, not the manifest.** The manifest describes the corpus;
+the shards *are* the corpus. Resuming off the description means any moment the
+two disagree -- a crash with rows still buffered, an interrupted upload -- marks
+sources done that hold no audio, and they are skipped for good. Reading the
+shards makes resumption self-healing: whatever did not land is segmented again.
+Only the `source_id` column is fetched, so it costs seconds and no audio.
 
-> every source named in the hub manifest has all of its audio in a shard
+Shards also flush only at a **source boundary**, so a source is never split
+between a shard and the buffer -- which is what lets presence in a shard mean
+"wholly present".
 
-Two rules enforce it. Shards flush only at a **source boundary** (so a source's
-segments are never split between a shard and the buffer), and the manifest is
-uploaded only **immediately after a successful shard flush**. Without both, a
-manifest can name sources whose audio is still buffered; resume then skips them
-permanently and their audio is uploaded by nobody. A crash costs re-segmenting up
-to one shard, never data.
+**Shard size is the unit of loss.** `--shard-mb` defaults to 100 (~1.5 h of
+audio). Larger shards read marginally faster and hurt much more to lose on a
+session that dies. Raise it only on a stable machine.
 
-`--push-every` governs the raw provenance files only, which commit on their own
-schedule and never drag the manifest with them.
+`--push-every` governs the raw provenance files only.
+
+### Repairing a run that crashed under an older version
+
+```bash
+warsh-data verify <user>/warsh-segments-v2 --write-missing missing.txt
+```
+
+```bash
+warsh-data segment ./audio --sources-file missing.txt --push-to <user>/warsh-segments-v2
+```
+
+`--sources-file` re-processes exactly those sources and ignores `--resume` --
+being named in the manifest is the reason they need redoing.
 
 Repo layout:
 

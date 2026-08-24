@@ -126,17 +126,32 @@ def test_clip_filename_carries_timestamps_but_id_does_not(fake_api, tmp_path, ke
     assert (sr, len(data)) == (16000, 16000)
 
 
-def test_done_sources_on_hub_is_empty_when_repo_missing(monkeypatch):
-    import huggingface_hub
+def test_done_sources_on_hub_is_empty_when_shards_cannot_be_read(monkeypatch):
+    import warshdata.hub as hub
 
     def boom(*args, **kwargs):
         raise OSError("no such repo")
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
-    assert done_sources_on_hub("u/does-not-exist") == set()
+    monkeypatch.setattr(hub, "shard_sources", boom)
+    assert hub.done_sources_on_hub("u/does-not-exist") == set()
 
 
-def test_done_sources_on_hub_reads_manifest(monkeypatch, tmp_path):
+def test_done_sources_comes_from_the_shards_not_the_manifest(monkeypatch):
+    """Resuming off the manifest marks sources done that hold no audio; they are
+    then skipped for good. The shards are the corpus, so they decide."""
+    import collections
+
+    import warshdata.hub as hub
+
+    monkeypatch.setattr(
+        hub, "shard_sources",
+        lambda repo_id, token=None: collections.Counter({"r/001": 12, "r/002": 8}),
+    )
+    # A manifest claiming more than the shards hold must not widen the result.
+    assert hub.done_sources_on_hub("u/r") == {"r/001", "r/002"}
+
+
+def test_manifest_sources_on_hub_still_readable(monkeypatch, tmp_path):
     import json
 
     import huggingface_hub
@@ -144,10 +159,11 @@ def test_done_sources_on_hub_reads_manifest(monkeypatch, tmp_path):
     manifest = tmp_path / "segments.jsonl"
     manifest.write_text(
         json.dumps(make_record(0)) + "\n"
-        + json.dumps(make_record(1)) + "\n"
         + json.dumps(make_record(2, source_id="other/002")) + "\n"
         + "{torn line\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **k: str(manifest))
-    assert done_sources_on_hub("u/r") == {"ibrahim-aldosari/087", "other/002"}
+    from warshdata.hub import manifest_sources_on_hub
+
+    assert manifest_sources_on_hub("u/r") == {"ibrahim-aldosari/087", "other/002"}

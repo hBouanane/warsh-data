@@ -47,11 +47,13 @@ import numpy as np
 import soundfile as sf
 
 __all__ = ["HubWriter", "DEFAULT_SHARD_BYTES", "done_sources_on_hub", "encode_flac",
-           "shard_sources", "manifest_sources"]
+           "shard_sources", "manifest_sources", "manifest_sources_on_hub"]
 
-#: Target audio bytes per shard.  ~400 MB keeps the shard count sane for a few
-#: hundred hours while staying small enough to stream comfortably.
-DEFAULT_SHARD_BYTES = 400 * 1024 * 1024
+#: Target audio bytes per shard.  This is also the unit of work lost when a
+#: session dies mid-shard, so it is deliberately modest: 100 MB is ~1.5 hours of
+#: audio, which streams perfectly well and costs little to redo.  Larger shards
+#: are marginally more efficient to read and much more painful to lose.
+DEFAULT_SHARD_BYTES = 100 * 1024 * 1024
 
 _README = """---
 license: cc-by-nc-4.0
@@ -106,11 +108,29 @@ def encode_flac(wave: np.ndarray, sample_rate: int = 16000) -> bytes:
 
 
 def done_sources_on_hub(repo_id: str, token: Optional[str] = None) -> Set[str]:
-    """Source ids already in the hub manifest, so a run resumes across sessions.
+    """Sources whose audio is actually in the shards.
 
-    Resuming reads the *manifest*, not the shards -- a few MB instead of the
-    whole corpus, which is the point of keeping the two separate.
+    Read from the shards, not from the manifest.  The manifest is a
+    *description* of the corpus; the shards are the corpus.  Resuming off the
+    description means that any moment where the two disagree -- a crash with
+    rows still buffered, an interrupted upload -- marks sources done that hold
+    no audio, and they are then skipped for good.  Reading the shards makes
+    resumption self-healing instead: anything that did not land is simply
+    segmented again.
+
+    Only the ``source_id`` column is fetched, so this costs a few seconds and
+    no audio.  Because shards only ever flush at a source boundary, a source
+    appearing here is a source that is wholly present.
     """
+    try:
+        return set(shard_sources(repo_id, token=token))
+    except Exception:
+        return set()
+
+
+def manifest_sources_on_hub(repo_id: str, token: Optional[str] = None) -> Set[str]:
+    """Sources named in the hub manifest.  Informational -- see the warning in
+    :func:`done_sources_on_hub` about resuming off this."""
     from huggingface_hub import hf_hub_download
 
     try:

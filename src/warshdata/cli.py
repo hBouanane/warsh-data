@@ -380,7 +380,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-duration-ms", type=int, default=19995)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--push-to", metavar="REPO_ID", help="stream shards to this HF dataset repo as they fill")
-    p.add_argument("--shard-mb", type=int, default=400, help="audio MB per parquet shard (default: 400)")
+    p.add_argument("--shard-mb", type=int, default=100,
+                   help="audio MB per parquet shard (default: 100); also how much work a crash costs, so bigger is not better on a flaky session")
     p.add_argument("--private", action="store_true", help="create the HF dataset repo private")
     p.add_argument("--no-raw", action="store_true", help="do not upload the source mp3s")
     p.add_argument("--push-every", type=int, default=10,
