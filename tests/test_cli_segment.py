@@ -340,3 +340,32 @@ def test_raw_commits_do_not_drag_the_manifest_with_them(fake_segment_module, fak
     # push is the final one.
     assert writer.events.count("flush_sources") >= 4
     assert writer.events.count("push_manifest") == 1
+
+
+def test_sources_file_overrides_resume(fake_segment_module, tmp_path):
+    """Sources listed for repair are re-segmented even though the manifest
+    already names them -- that is precisely why they need repairing."""
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips"])
+    calls_before = len(fake_segment_module)
+
+    listing = tmp_path / "missing.txt"
+    listing.write_text("ibrahim-aldosari/002\n", encoding="utf-8")
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips",
+         "--sources-file", str(listing), "--resume"])
+
+    assert fake_segment_module[calls_before:] == ["ibrahim-aldosari/002"]
+
+
+def test_sources_file_warns_about_unknown_ids(fake_segment_module, tmp_path, capsys):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    out = tmp_path / "out"
+    listing = tmp_path / "missing.txt"
+    listing.write_text("ibrahim-aldosari/001\nnobody/999\n", encoding="utf-8")
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--sources-file", str(listing)])
+    err = capsys.readouterr().err
+    assert "not found" in err and "nobody/999" in err

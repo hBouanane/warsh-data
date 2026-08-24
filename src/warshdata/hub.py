@@ -46,7 +46,8 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import soundfile as sf
 
-__all__ = ["HubWriter", "DEFAULT_SHARD_BYTES", "done_sources_on_hub", "encode_flac"]
+__all__ = ["HubWriter", "DEFAULT_SHARD_BYTES", "done_sources_on_hub", "encode_flac",
+           "shard_sources", "manifest_sources"]
 
 #: Target audio bytes per shard.  ~400 MB keeps the shard count sane for a few
 #: hundred hours while staying small enough to stream comfortably.
@@ -133,6 +134,43 @@ def done_sources_on_hub(repo_id: str, token: Optional[str] = None) -> Set[str]:
             except (json.JSONDecodeError, KeyError):
                 continue
     return done
+
+
+def shard_sources(repo_id: str, token: Optional[str] = None) -> "collections.Counter[str]":
+    """Count segments per source across the shards, reading only that column.
+
+    Parquet is columnar, so this pulls the ``source_id`` column and nothing
+    else -- the audio, which is all the size, is never transferred.
+    """
+    import collections
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    fs = HfFileSystem(token=token)
+    counts: "collections.Counter[str]" = collections.Counter()
+    for path in sorted(fs.glob(f"datasets/{repo_id}/data/shard-*.parquet")):
+        with fs.open(path, "rb") as fh:
+            table = pq.ParquetFile(fh).read(columns=["source_id"])
+        counts.update(table.column("source_id").to_pylist())
+    return counts
+
+
+def manifest_sources(manifest_path: Path) -> "collections.Counter[str]":
+    """Count segments per source in a manifest file."""
+    import collections
+
+    counts: "collections.Counter[str]" = collections.Counter()
+    with Path(manifest_path).open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                counts[json.loads(line)["source_id"]] += 1
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return counts
 
 
 @dataclass

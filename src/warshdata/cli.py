@@ -54,7 +54,22 @@ def cmd_segment(args: argparse.Namespace) -> int:
             if s.source_id in already and f"raw/{s.reciter_slug}/{s.path.name}" not in on_hub:
                 writer.queue_source(s.path, s.reciter_slug)
 
-    pending = [s for s in sources if s.source_id not in already]
+    if args.sources_file:
+        wanted = {
+            line.strip()
+            for line in Path(args.sources_file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        # These are being re-segmented deliberately, so `already` must not veto
+        # them -- being listed in the manifest is exactly why they are here.
+        pending = [s for s in sources if s.source_id in wanted]
+        unknown = wanted - {s.source_id for s in sources}
+        if unknown:
+            print(f"warning: {len(unknown)} source id(s) not found in {args.input}", file=sys.stderr)
+            for u in sorted(unknown)[:10]:
+                print(f"  {u}", file=sys.stderr)
+    else:
+        pending = [s for s in sources if s.source_id not in already]
     if args.limit:
         pending = pending[: args.limit]
 
@@ -289,6 +304,61 @@ def cmd_apply_corrections(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Check that every source named in the hub manifest has audio in a shard."""
+    from huggingface_hub import hf_hub_download
+
+    from .hub import manifest_sources, shard_sources
+
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+    else:
+        print(f"Fetching manifest from {args.repo} ...")
+        manifest_path = Path(
+            hf_hub_download(
+                repo_id=args.repo, filename="manifests/segments.jsonl", repo_type="dataset"
+            )
+        )
+
+    man = manifest_sources(manifest_path)
+    print(f"Manifest : {sum(man.values())} segments across {len(man)} sources")
+
+    print(f"Reading shard source_id columns from {args.repo} ...")
+    shards = shard_sources(args.repo)
+    print(f"Shards   : {sum(shards.values())} segments across {len(shards)} sources")
+
+    missing = sorted(s for s in man if shards.get(s, 0) == 0)
+    partial = sorted(s for s in man if 0 < shards.get(s, 0) < man[s])
+    orphan = sorted(s for s in shards if s not in man)
+
+    print()
+    print(f"Sources in the manifest with NO audio in any shard : {len(missing)}")
+    print(f"Sources only partly present in the shards          : {len(partial)}")
+    print(f"Sources in shards but not in the manifest          : {len(orphan)}")
+
+    for label, items in (("missing", missing), ("partial", partial)):
+        for src in items[:15]:
+            print(f"  {label:<8} {src:<32} manifest {man[src]:>5}  shards {shards.get(src, 0):>5}")
+        if len(items) > 15:
+            print(f"  ... and {len(items) - 15} more")
+
+    broken = missing + partial
+    if args.write_missing and broken:
+        out = Path(args.write_missing)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(broken) + "\n", encoding="utf-8")
+        print(f"\nWrote {len(broken)} source id(s) to {out}")
+        print(f"Re-segment them with:  warsh-data segment <audio> --sources-file {out} ...")
+
+    if broken:
+        print("\nThese sources are named in the manifest but their audio is absent, so a")
+        print("plain --resume would skip them for good. Re-segment them explicitly.")
+        return 1
+
+    print("\nClean: every source in the manifest has all of its audio in the shards.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -300,6 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-clips", action="store_true", help="write the manifest only, no clip files")
     p.add_argument("--resume", action="store_true", help="skip sources already in the manifest")
     p.add_argument("--limit", type=int, default=0, help="process at most N recordings")
+    p.add_argument("--sources-file", metavar="PATH",
+                   help="restrict to the source ids listed in this file, one per line, "
+                        "and process them even if --resume would skip them")
     p.add_argument("--dry-run", action="store_true", help="list what would be processed and exit")
     p.add_argument("--min-silence-duration-ms", type=int, default=200)
     p.add_argument("--min-speech-duration-ms", type=int, default=400)
@@ -328,6 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-variant-tariq", action="store_true",
                    help="also fetch Warsh via Tariq al-Asbahani, whose pronunciation differs")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("verify", help="check the hub manifest against the shards")
+    p.add_argument("repo", help="HF dataset repo id")
+    p.add_argument("--manifest", help="use a local manifest instead of downloading it")
+    p.add_argument("--write-missing", metavar="PATH", help="write broken source ids to this file")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")
