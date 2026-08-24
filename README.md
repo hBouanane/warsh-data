@@ -65,9 +65,12 @@ from drifting off the predicted boundary and clipping a first syllable.
 The final segment of such a recording is not waqf-bounded; `stats` counts these
 separately and they should not be trusted as training examples.
 
-**dtype is auto-detected.** bfloat16 where the GPU really supports it, float16 on
-pre-Ampere cards (a Colab T4 has no bfloat16), float32 on CPU. Override with
-`--dtype`. The resolved value is written to `segment_params.json`.
+**dtype is auto-detected**, gated on compute capability >= 8.0 rather than on
+`torch.cuda.is_bf16_supported()` alone -- that call reports True on pre-Ampere
+cards (a T4) on the strength of emulated bfloat16, which runs but is slower than
+fp16. So: bfloat16 on Ampere and newer, float16 on older CUDA cards, float32 on
+CPU. Override with `--dtype`. The resolved value is written to
+`segment_params.json`.
 
 **On Colab, write the output somewhere that survives.** The runtime's local disk
 is wiped when the session ends. Point `-o` at a mounted Drive folder, or push to

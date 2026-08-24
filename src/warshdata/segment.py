@@ -38,6 +38,22 @@ _DTYPES = {
 }
 
 
+def _has_native_bf16() -> bool:
+    """True only where bfloat16 has hardware support, i.e. Ampere (sm_80) or newer.
+
+    ``torch.cuda.is_bf16_supported()`` alone is not enough: on pre-Ampere cards
+    it reports True on the strength of *emulated* bf16, which runs but is far
+    slower than fp16.  Newer PyTorch exposes ``including_emulation=False`` for
+    exactly this; where that argument does not exist, fall back to the compute
+    capability, which is the underlying fact either way.
+    """
+    try:
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except TypeError:
+        major, _minor = torch.cuda.get_device_capability()
+        return major >= 8
+
+
 @dataclass
 class SegmentParams:
     """Thresholds handed to :func:`clean_speech_intervals`.
@@ -68,9 +84,9 @@ class SegmentParams:
         """
         if self.dtype != "auto":
             return _DTYPES[self.dtype]
-        if self.device == "cpu":
+        if self.device == "cpu" or not torch.cuda.is_available():
             return torch.float32
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.bfloat16 if _has_native_bf16() else torch.float16
 
 
 class Segmenter:
