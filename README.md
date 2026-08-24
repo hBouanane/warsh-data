@@ -151,6 +151,17 @@ what labels are keyed to, so it must not.
 is later re-run with different thresholds and a segment has moved, the correction
 is reported as *drifted* rather than applied blind to audio nobody reviewed.
 
+## Tests
+
+```bash
+pip install -e ".[dev]" && python -m pytest
+```
+
+62 tests, no network and no GPU: the segmenter and the Hub API are both stubbed,
+so the suite runs anywhere. That is deliberate -- the bugs it exists to catch are
+in the plumbing (does the final shard actually get pushed? does a drop renumber
+its neighbours?), not in the model.
+
 ## Notes
 
 **Resume is real.** Records are appended and flushed after each source file, so an

@@ -18,8 +18,6 @@ from .sources import discover
 
 
 def cmd_segment(args: argparse.Namespace) -> int:
-    from .segment import MODEL_ID, SegmentParams, Segmenter
-
     out_dir = Path(args.output)
     manifest_path = out_dir / "segments.jsonl"
     params_path = out_dir / "segment_params.json"
@@ -31,7 +29,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
         return 1
 
     writer = None
-    if args.push_to:
+    if args.push_to and not args.dry_run:
         from .hub import HubWriter, done_sources_on_hub
 
         writer = HubWriter(
@@ -62,6 +60,23 @@ def cmd_segment(args: argparse.Namespace) -> int:
 
     print(f"Found {len(sources)} recording(s); {len(already)} already done; {len(pending)} to process.")
 
+    if args.dry_run:
+        for s in pending:
+            print(f"  {s.source_id}  <-  {s.path}")
+        return 0
+
+    if not pending:
+        # Nothing to segment, but an earlier session may still have left raw
+        # files unsent -- returning here without flushing would strand them.
+        if writer is not None:
+            writer.flush_sources()
+        return 0
+
+    # Imported here rather than at module scope: this is the only path that
+    # needs torch, so --help, --dry-run and a bad input path stay usable
+    # without the model stack installed.
+    from .segment import MODEL_ID, SegmentParams, Segmenter
+
     params = SegmentParams(
         min_silence_duration_ms=args.min_silence_duration_ms,
         min_speech_duration_ms=args.min_speech_duration_ms,
@@ -71,14 +86,6 @@ def cmd_segment(args: argparse.Namespace) -> int:
         device=args.device,
         dtype=args.dtype,
     )
-
-    if args.dry_run:
-        for s in pending:
-            print(f"  {s.source_id}  <-  {s.path}")
-        return 0
-
-    if not pending:
-        return 0
 
     segmenter = Segmenter(params)
 
