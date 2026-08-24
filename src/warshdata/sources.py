@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-__all__ = ["Source", "AUDIO_SUFFIXES", "discover", "slugify", "segment_id"]
+__all__ = ["Source", "AUDIO_SUFFIXES", "discover", "slugify", "segment_id", "clip_name"]
 
 #: Formats the segmenter's reader accepts.
 AUDIO_SUFFIXES = {".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".opus"}
@@ -81,3 +81,16 @@ def segment_id(source: Source, index: int) -> str:
     rather than silently applied to the wrong audio.
     """
     return f"{source.reciter_slug}__{slugify(source.path.stem)}__{index:04d}"
+
+
+def clip_name(segment_id: str, start_sample: int, end_sample: int, sample_rate: int = 16000) -> str:
+    """Filename for a clip: the stable id plus the boundaries it currently has.
+
+    The timestamps are here and not in the id on purpose.  A filename is a
+    display of the segment's present state and is expected to change when a
+    boundary is corrected; the id is what labels and review notes are keyed to,
+    so it must not.
+    """
+    start_ms = int(round(start_sample * 1000 / sample_rate))
+    end_ms = int(round(end_sample * 1000 / sample_rate))
+    return f"{segment_id}__{start_ms}-{end_ms}ms"

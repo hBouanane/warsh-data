@@ -21,7 +21,7 @@ from recitations_segmenter import clean_speech_intervals, segment_recitations
 
 from .audio import load_wave
 from .manifest import SegmentRecord
-from .sources import Source, segment_id
+from .sources import Source, clip_name, segment_id
 
 __all__ = ["SegmentParams", "Segmenter", "MODEL_ID", "SAMPLE_RATE"]
 
@@ -157,7 +157,8 @@ class Segmenter:
             sid = segment_id(source, i)
             audio_path = None
             if clips_dir is not None:
-                clip_path = Path(clips_dir) / source.reciter_slug / "clips" / f"{sid}.wav"
+                name = clip_name(sid, start, end, SAMPLE_RATE)
+                clip_path = Path(clips_dir) / source.reciter_slug / "clips" / f"{name}.wav"
                 clip_path.parent.mkdir(parents=True, exist_ok=True)
                 sf.write(clip_path, wave[start:end].float().numpy(), SAMPLE_RATE)
                 audio_path = str(clip_path.as_posix())

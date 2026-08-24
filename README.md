@@ -128,7 +128,14 @@ warsh-data apply-corrections ./out/segments.jsonl ./out/corrections.jsonl -o ./o
 
 Segment ids are `<reciter>__<surah>__<ordinal>` and deliberately **do not encode
 timestamps**, so moving a boundary does not change the id and does not orphan the
-label, note, or review attached to it.
+label, note, or review attached to it. Dropping a segment leaves every other id
+alone -- ordinals are assigned once at segmentation and never recomputed, so a
+drop leaves a gap rather than renumbering what follows.
+
+Clip *filenames* do carry the boundaries --
+`ibrahim-aldosari__087__0003__12400-18880ms.flac` -- because a filename shows the
+segment's present state and is expected to change when it is corrected. The id is
+what labels are keyed to, so it must not.
 
 `orig_*_seconds` records what the reviewer actually listened to. If segmentation
 is later re-run with different thresholds and a segment has moved, the correction

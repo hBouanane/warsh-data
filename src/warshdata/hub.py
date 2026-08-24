@@ -190,7 +190,12 @@ class HubWriter:
     def add(self, record: Dict[str, Any], wave: np.ndarray) -> None:
         row = dict(record)
         audio_bytes = encode_flac(wave)
-        row["audio"] = {"bytes": audio_bytes, "path": f"{record['segment_id']}.flac"}
+        from .sources import clip_name
+
+        name = clip_name(
+            record["segment_id"], record["start_sample"], record["end_sample"], record["sample_rate"]
+        )
+        row["audio"] = {"bytes": audio_bytes, "path": f"{name}.flac"}
         self._rows.append(row)
         self._buffered += len(audio_bytes)
         if self._buffered >= self.shard_bytes:
