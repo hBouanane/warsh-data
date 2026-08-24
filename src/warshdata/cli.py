@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
@@ -198,22 +198,54 @@ def cmd_stats(args: argparse.Namespace) -> int:
         print("Manifest is empty or missing.", file=sys.stderr)
         return 1
 
-    per_reciter = Counter(r["reciter_slug"] for r in records)
+    def pct(sorted_vals, q):
+        return sorted_vals[min(len(sorted_vals) - 1, int(q * len(sorted_vals)))]
+
     durations = sorted(r["duration_seconds"] for r in records)
     hours = sum(durations) / 3600
-    incomplete = sum(1 for r in records if not r.get("source_is_complete", True) and r.get("is_last_of_source"))
-
-    def pct(q: float) -> float:
-        return durations[min(len(durations) - 1, int(q * len(durations)))]
+    incomplete = sum(
+        1 for r in records if not r.get("source_is_complete", True) and r.get("is_last_of_source")
+    )
 
     print(f"Segments      : {len(records)}")
     print(f"Sources       : {len({r['source_id'] for r in records})}")
     print(f"Audio         : {hours:.2f} h")
-    print(f"Duration (s)  : min {durations[0]:.2f}  p50 {pct(0.5):.2f}  p95 {pct(0.95):.2f}  max {durations[-1]:.2f}")
+    print(f"Duration (s)  : min {durations[0]:.2f}  p50 {pct(durations, 0.5):.2f}  "
+          f"p95 {pct(durations, 0.95):.2f}  max {durations[-1]:.2f}")
     print(f"Unbounded end : {incomplete} segment(s) from cut-off recordings")
-    print("\nPer reciter:")
-    for slug, count in per_reciter.most_common():
-        print(f"  {slug:<35} {count:>7}")
+
+    by_reciter = defaultdict(list)
+    for r in records:
+        by_reciter[r["reciter_slug"]].append(r)
+
+    # Per reciter, because one set of thresholds does not fit every pace: a fast
+    # reciter over-segments on the same silence floor that makes a slow one
+    # under-segment.  The two tails are the tell.
+    print()
+    print(f"{'reciter':<30} {'segs':>6} {'audio':>7} {'p5':>6} {'p50':>6} {'p95':>6} "
+          f"{'max':>6} {'<1s':>6} {'>20s':>6}")
+    print("-" * 92)
+    suspects = []
+    for slug, rows in sorted(by_reciter.items()):
+        d = sorted(x["duration_seconds"] for x in rows)
+        short = sum(1 for x in d if x < 1.0) / len(d)
+        long_ = sum(1 for x in d if x > 20.0) / len(d)
+        print(f"{slug:<30} {len(d):>6} {sum(d) / 3600:>6.2f}h "
+              f"{pct(d, 0.05):>6.1f} {pct(d, 0.5):>6.1f} {pct(d, 0.95):>6.1f} {d[-1]:>6.1f} "
+              f"{short * 100:>5.1f}% {long_ * 100:>5.1f}%")
+        if short > 0.10:
+            suspects.append(f"{slug}: {short * 100:.0f}% of segments under 1 s -- "
+                            f"likely over-segmenting, try a higher --min-silence-duration-ms")
+        if long_ > 0.10:
+            suspects.append(f"{slug}: {long_ * 100:.0f}% of segments over 20 s -- "
+                            f"waqf being missed, and past the model's 20 s window; "
+                            f"try a lower --min-silence-duration-ms")
+
+    if suspects:
+        print()
+        print("Worth a listen:")
+        for line in suspects:
+            print(f"  {line}")
     return 0
 
 

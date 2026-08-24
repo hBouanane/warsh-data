@@ -76,6 +76,38 @@ warsh-data segment ./audio -o ./out --resume
 warsh-data stats ./out/segments.jsonl
 ```
 
+## Checking the thresholds before a full pass
+
+Reciters differ enormously in pace, and one silence floor does not fit all of
+them: the same setting that over-segments a fast reciter makes a slow mujawwad
+one swallow waqf. Probe a few surahs across every reciter first.
+
+```bash
+warsh-data fetch --surah 1 --surah 87 --surah 36 -o ./probe-audio
+```
+
+```bash
+warsh-data segment ./probe-audio -o ./probe && warsh-data stats ./probe/segments.jsonl
+```
+
+`stats` breaks duration down per reciter and flags the two tails:
+
+```
+reciter                          segs   audio     p5    p50    p95    max    <1s   >20s
+fast-reciter                      200   0.06h    0.4    1.1    2.0    2.0  40.5%   0.0%
+ibrahim-aldosari                  200   0.37h    4.2    6.7    8.8    9.0   0.0%   0.0%
+slow-mujawwad                     200   1.16h   12.6   20.5   29.1   29.9   0.0%  54.0%
+
+Worth a listen:
+  fast-reciter: 40% of segments under 1 s -- likely over-segmenting, ...
+  slow-mujawwad: 54% of segments over 20 s -- waqf being missed, ...
+```
+
+Many sub-second segments mean the silence floor is too low. Many over 20 s mean
+waqf is being missed *and* the segment exceeds the model's own 20 s window. The
+global summary above this table would read a healthy p50 of 6.7 s and show
+neither problem, which is why the per-reciter view exists.
+
 Outputs:
 
 - `out/segments.jsonl` — one record per segment, appended per source file
