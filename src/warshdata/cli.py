@@ -359,6 +359,37 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_purge(args: argparse.Namespace) -> int:
+    """Remove every row for the given sources from the shards."""
+    from .hub import purge_sources
+
+    sources = {
+        line.strip()
+        for line in Path(args.sources_file).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    if not sources:
+        print(f"No source ids in {args.sources_file}", file=sys.stderr)
+        return 1
+
+    print(f"Purging {len(sources)} source(s) from {args.repo}"
+          + ("  [dry run]" if args.dry_run else ""))
+    report = purge_sources(
+        args.repo, sources, work_dir=Path(args.work_dir), dry_run=args.dry_run
+    )
+
+    for name, removed, kept in report["rewritten"]:
+        print(f"  {name}: removed {removed}, kept {kept}")
+    for name in report["deleted"]:
+        print(f"  {name}: deleted (empty after purge)")
+    print(f"\nScanned {report['scanned']} shard(s); removed {report['rows_removed']} row(s)")
+
+    if not args.dry_run and report["rows_removed"]:
+        print(f"Now re-segment them:  warsh-data segment <audio> "
+              f"--sources-file {args.sources_file} --push-to {args.repo}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -408,6 +439,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--manifest", help="use a local manifest instead of downloading it")
     p.add_argument("--write-missing", metavar="PATH", help="write broken source ids to this file")
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("purge", help="delete a source's rows from the shards")
+    p.add_argument("repo", help="HF dataset repo id")
+    p.add_argument("sources_file", help="file of source ids, one per line")
+    p.add_argument("--work-dir", default="./_purge", help="scratch dir for shard rewrites")
+    p.add_argument("--dry-run", action="store_true", help="report what would change and exit")
+    p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")

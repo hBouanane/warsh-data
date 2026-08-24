@@ -151,8 +151,35 @@ warsh-data verify <user>/warsh-segments-v2 --write-missing missing.txt
 warsh-data segment ./audio --sources-file missing.txt --push-to <user>/warsh-segments-v2
 ```
 
+A source reported as **partial** -- some of its segments in a shard, the rest
+lost -- needs its stale rows removed before it is re-segmented, or the corpus
+ends up holding both copies:
+
+```bash
+warsh-data purge <user>/warsh-segments-v2 missing.txt --dry-run
+```
+
+```bash
+warsh-data purge <user>/warsh-segments-v2 missing.txt
+```
+
+Parquet is immutable, so a shard holding doomed rows is rewritten without them
+and re-uploaded under the same name; a shard left empty is deleted. Shards
+holding none of the targets are never downloaded, and the audio that survives is
+copied through by pyarrow rather than re-encoded.
+
+Then re-segment:
+
+```bash
+warsh-data segment ./audio --sources-file missing.txt --push-to <user>/warsh-segments-v2
+```
+
 `--sources-file` re-processes exactly those sources and ignores `--resume` --
 being named in the manifest is the reason they need redoing.
+
+Purging rather than de-duplicating at training time is deliberate: a consumer
+using `streaming=True` would have to carry every id it had seen to drop the
+duplicates, so the published corpus should simply be correct.
 
 Repo layout:
 

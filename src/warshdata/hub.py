@@ -47,7 +47,7 @@ import numpy as np
 import soundfile as sf
 
 __all__ = ["HubWriter", "DEFAULT_SHARD_BYTES", "done_sources_on_hub", "encode_flac",
-           "shard_sources", "manifest_sources", "manifest_sources_on_hub"]
+           "shard_sources", "manifest_sources", "manifest_sources_on_hub", "purge_sources"]
 
 #: Target audio bytes per shard.  This is also the unit of work lost when a
 #: session dies mid-shard, so it is deliberately modest: 100 MB is ~1.5 hours of
@@ -191,6 +191,77 @@ def manifest_sources(manifest_path: Path) -> "collections.Counter[str]":
             except (json.JSONDecodeError, KeyError):
                 continue
     return counts
+
+
+def purge_sources(
+    repo_id: str,
+    sources: Set[str],
+    work_dir: Path,
+    token: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Delete every row belonging to ``sources`` from the shards.
+
+    Parquet files are immutable, so a shard holding a doomed row is rewritten
+    without it and re-uploaded under the same name; a shard left with no rows is
+    deleted outright.  Each shard's ``source_id`` column is checked first, so
+    shards that hold none of the targets are never downloaded.
+
+    The alternative -- leaving stale rows and de-duplicating at training time --
+    does not survive ``streaming=True``, where a consumer would have to carry
+    every id it has seen.  Better that the published corpus is simply correct.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, HfFileSystem
+
+    api = HfApi(token=token)
+    fs = HfFileSystem(token=token)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    report: Dict[str, Any] = {"rewritten": [], "deleted": [], "rows_removed": 0, "scanned": 0}
+
+    for path in sorted(fs.glob(f"datasets/{repo_id}/data/shard-*.parquet")):
+        name = Path(path).name
+        report["scanned"] += 1
+
+        with fs.open(path, "rb") as fh:
+            present = set(pq.ParquetFile(fh).read(columns=["source_id"]).column("source_id").to_pylist())
+        hit = present & sources
+        if not hit:
+            continue
+
+        with fs.open(path, "rb") as fh:
+            table = pq.read_table(fh)
+
+        mask = pc.invert(pc.is_in(table.column("source_id"), value_set=pa.array(sorted(sources))))
+        kept = table.filter(mask)
+        removed = table.num_rows - kept.num_rows
+        report["rows_removed"] += removed
+
+        if dry_run:
+            report["rewritten"].append((name, removed, kept.num_rows))
+            continue
+
+        if kept.num_rows == 0:
+            api.delete_file(path_in_repo=f"data/{name}", repo_id=repo_id, repo_type="dataset",
+                            commit_message=f"Drop {name}: all {removed} rows purged")
+            report["deleted"].append(name)
+            continue
+
+        local = work_dir / name
+        # pyarrow round-trip rather than datasets: it preserves the schema and
+        # its HF metadata exactly, and never re-encodes the audio.
+        pq.write_table(kept, local)
+        api.upload_file(path_or_fileobj=str(local), path_in_repo=f"data/{name}",
+                        repo_id=repo_id, repo_type="dataset",
+                        commit_message=f"Purge {removed} row(s) from {name}")
+        local.unlink(missing_ok=True)
+        report["rewritten"].append((name, removed, kept.num_rows))
+
+    return report
 
 
 @dataclass
