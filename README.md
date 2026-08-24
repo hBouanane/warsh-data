@@ -117,86 +117,45 @@ Outputs:
 ## Push to the Hub
 
 ```bash
-warsh-data segment ./audio -o ./out --push-to <user>/warsh-segments-v2 --resume
+warsh-data segment ./audio -o ./out --push-to <user>/warsh-segments --resume
 ```
 
-Segments stream into parquet shards and upload as each fills, so local disk never
-grows past one shard. `--resume` reads the *manifest* from the Hub -- a few MB,
-not the corpus -- so a run continues across sessions.
+**One source recording becomes one parquet file, named after it:**
 
-**Resume reads the shards, not the manifest.** The manifest describes the corpus;
-the shards *are* the corpus. Resuming off the description means any moment the
-two disagree -- a crash with rows still buffered, an interrupted upload -- marks
-sources done that hold no audio, and they are skipped for good. Reading the
-shards makes resumption self-healing: whatever did not land is segmented again.
-Only the `source_id` column is fetched, so it costs seconds and no audio.
+| path | what |
+|---|---|
+| `data/<reciter>/<surah>.parquet` | that recording's segments, audio embedded as 16 kHz mono FLAC |
+| `raw/<reciter>/<surah>.mp3` | the recording it came from |
+| `segment_params.json` | the settings used |
 
-Shards also flush only at a **source boundary**, so a source is never split
-between a shard and the buffer -- which is what lets presence in a shard mean
-"wholly present".
+That naming carries the safety properties, and they are properties rather than
+conventions -- there is no bookkeeping to get out of step:
 
-**Shard size is the unit of loss.** `--shard-mb` defaults to 100 (~1.5 h of
-audio). Larger shards read marginally faster and hurt much more to lose on a
-session that dies. Raise it only on a stable machine.
-
-`--push-every` governs the raw provenance files only.
-
-### Repairing a run that crashed under an older version
-
-```bash
-warsh-data verify <user>/warsh-segments-v2 --write-missing missing.txt
-```
-
-```bash
-warsh-data segment ./audio --sources-file missing.txt --push-to <user>/warsh-segments-v2
-```
-
-A source reported as **partial** -- some of its segments in a shard, the rest
-lost -- needs its stale rows removed before it is re-segmented, or the corpus
-ends up holding both copies:
-
-```bash
-warsh-data purge <user>/warsh-segments-v2 missing.txt --dry-run
-```
-
-```bash
-warsh-data purge <user>/warsh-segments-v2 missing.txt
-```
-
-Parquet is immutable, so a shard holding doomed rows is rewritten without them
-and re-uploaded under the same name; a shard left empty is deleted. Shards
-holding none of the targets are never downloaded, and the audio that survives is
-copied through by pyarrow rather than re-encoded.
-
-Then re-segment:
-
-```bash
-warsh-data segment ./audio --sources-file missing.txt --push-to <user>/warsh-segments-v2
-```
-
-`--sources-file` re-processes exactly those sources and ignores `--resume` --
-being named in the manifest is the reason they need redoing.
-
-Purging rather than de-duplicating at training time is deliberate: a consumer
-using `streaming=True` would have to carry every id it had seen to drop the
-duplicates, so the published corpus should simply be correct.
-
-Repo layout:
-
-| path | what | read during training |
-|---|---|---|
-| `data/shard-*.parquet` | rows + audio embedded as 16 kHz mono FLAC | yes, streamed |
-| `manifests/segments.jsonl` | same rows, no audio | no |
-| `raw/<reciter>/NNN.mp3` | source recordings | no |
+- **Resume is a file listing.** The path encodes the source id, so `--resume`
+  asks the repo what exists. Nothing is downloaded and no separate record can
+  contradict the data.
+- **Re-running a source overwrites its own file.** Duplicates cannot accumulate,
+  so nothing ever needs purging or de-duplicating.
+- **A source is committed whole or not at all.** Its parquet and its mp3 go up in
+  a single atomic commit. A crash leaves the source simply absent, and the next
+  `--resume` redoes it. There is no partial state to detect or repair.
+- **Nothing is buffered.** A crash costs at most the recording in progress.
 
 ```python
 from datasets import load_dataset
-ds = load_dataset("<user>/warsh-segments-v2", split="train", streaming=True)
+ds = load_dataset("<user>/warsh-segments", split="train", streaming=True)
 ```
 
-Embedded audio in sharded parquet, rather than one file per clip: hundreds of
-thousands of small LFS objects are slow to list, slow to fetch, and awkward to
-shuffle. Streaming pulls only the shards being iterated.
+Roughly 1500 files for a full Warsh corpus, averaging ~17 MB. Per-file overhead
+across a training epoch is minutes against hours, and more files give the
+streaming shuffler finer granularity.
+
+To read the whole corpus as a manifest without downloading any audio -- parquet
+is columnar, so the audio column is never fetched:
+
+```bash
+warsh-data manifest <user>/warsh-segments -o segments.jsonl
+```
 
 ## Correcting segments by hand
 

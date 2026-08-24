@@ -1,169 +1,197 @@
-"""HubWriter: sharding, resumption, and the invariant that local disk stays small."""
+"""HubStore: one source, one file, one commit.
+
+The properties asserted here are exactly the ones the old buffered design kept
+getting wrong, so they are checked directly rather than inferred.
+"""
 
 from __future__ import annotations
 
 import io
-from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 from conftest import make_record, make_wave
 
-from warshdata.hub import HubWriter, done_sources_on_hub, encode_flac
+from warshdata.hub import (
+    HubStore,
+    build_parquet,
+    encode_flac,
+    shard_path_for,
+    source_id_from_shard_path,
+)
+
+
+def records_and_waves(n=3, source_id="ibrahim-aldosari/087"):
+    reciter, stem = source_id.split("/")
+    records = [
+        make_record(i, segment_id=f"{reciter}__{stem}__{i:04d}", source_id=source_id,
+                    reciter_slug=reciter)
+        for i in range(n)
+    ]
+    return records, [make_wave(0.25, seed=i) for i in range(n)]
 
 
 def test_encode_flac_round_trips():
     wave = make_wave(1.0)
     data, sr = sf.read(io.BytesIO(encode_flac(wave)), dtype="float32")
     assert sr == 16000
-    assert data.shape == wave.shape
-    # PCM_16 quantisation is the only loss.
-    assert np.abs(data - wave).max() < 2e-4
+    assert np.abs(data - wave).max() < 2e-4       # PCM_16 quantisation only
 
 
-def test_add_never_flushes_on_its_own(fake_api, tmp_path):
-    """Flushing mid-source would strand the rest of that source's audio."""
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=1)
-    for i in range(5):
-        writer.add(make_record(i), make_wave(1.0, seed=i))
-    assert [f for f in fake_api.uploads if f.startswith("data/")] == []
-    assert writer.rows_written == 0
+@pytest.mark.parametrize("reciter,stem,path", [
+    ("ibrahim-aldosari", "087", "data/ibrahim-aldosari/087.parquet"),
+    ("rachid-belalya", "002", "data/rachid-belalya/002.parquet"),
+])
+def test_shard_path_round_trips_to_the_source_id(reciter, stem, path):
+    assert shard_path_for(reciter, stem) == path
+    assert source_id_from_shard_path(path) == f"{reciter}/{stem}"
 
 
-def test_maybe_flush_writes_when_full(fake_api, tmp_path):
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path / "_shards", shard_bytes=60_000)
-    shards_seen = 0
-    for i in range(12):
-        writer.add(make_record(i), make_wave(1.0, seed=i))
-        if writer.maybe_flush() is not None:      # called at a source boundary
-            shards_seen += 1
-    writer.flush()
-
-    shards = [f for f in fake_api.uploads if f.startswith("data/")]
-    assert shards_seen >= 1, "buffer should have filled at least once"
-    assert len(shards) >= 2
-    assert shards == sorted(shards), "shards must be uploaded in order"
-    assert writer.rows_written == 12
-    # The point of streaming: nothing accumulates on disk.
-    assert list((tmp_path / "_shards").glob("*.parquet")) == []
+@pytest.mark.parametrize("path", [
+    "README.md",
+    "raw/ibrahim-aldosari/087.mp3",
+    "segment_params.json",
+    "data/loose.parquet",
+    "data/a/b/c.parquet",
+])
+def test_non_shard_paths_are_not_mistaken_for_sources(path):
+    assert source_id_from_shard_path(path) is None
 
 
-def test_maybe_flush_is_a_noop_below_the_threshold(fake_api, tmp_path):
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=10**9)
-    writer.add(make_record(0), make_wave(1.0))
-    assert writer.maybe_flush() is None
-    assert [f for f in fake_api.uploads if f.startswith("data/")] == []
+def test_write_source_is_a_single_commit(fake_api, tmp_path):
+    store = HubStore(repo_id="u/r", work_dir=tmp_path / "work")
+    raw = tmp_path / "087.mp3"
+    raw.write_bytes(b"fake mp3")
+    records, waves = records_and_waves()
+
+    store.write_source("ibrahim-aldosari", "087", records, waves, raw_path=raw)
+
+    # Parquet and mp3 together in one commit: never one without the other.
+    assert len(fake_api.commits) == 1
+    assert fake_api.commits[0] == [
+        "data/ibrahim-aldosari/087.parquet",
+        "raw/ibrahim-aldosari/087.mp3",
+    ]
+    assert store.rows_written == 3
+    assert store.sources_written == 1
 
 
-def test_flush_is_a_noop_when_empty(fake_api, tmp_path):
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=10**9)
-    assert writer.flush() is None
-    assert [f for f in fake_api.uploads if f.startswith("data/")] == []
+def test_no_raw_omits_the_mp3(fake_api, tmp_path):
+    store = HubStore(repo_id="u/r", work_dir=tmp_path / "work", upload_raw=False)
+    raw = tmp_path / "087.mp3"
+    raw.write_bytes(b"x")
+    records, waves = records_and_waves()
+
+    store.write_source("ibrahim-aldosari", "087", records, waves, raw_path=raw)
+    assert fake_api.commits[0] == ["data/ibrahim-aldosari/087.parquet"]
 
 
-def test_shard_numbering_continues_across_sessions(fake_api, tmp_path):
-    first = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=10**9)
-    first.add(make_record(0), make_wave(0.5))
-    first.flush()
+def test_missing_raw_file_does_not_break_the_commit(fake_api, tmp_path):
+    store = HubStore(repo_id="u/r", work_dir=tmp_path / "work")
+    records, waves = records_and_waves()
 
-    second = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=10**9)
-    # Restarting at 0 would overwrite the first session's shard.
-    assert second.shard_index == first.shard_index
+    store.write_source("ibrahim-aldosari", "087", records, waves,
+                       raw_path=tmp_path / "gone.mp3")
+    assert fake_api.commits[0] == ["data/ibrahim-aldosari/087.parquet"]
+
+
+def test_rewriting_a_source_targets_the_same_path(fake_api, tmp_path):
+    """Why duplicates are impossible: the second write replaces the first."""
+    store = HubStore(repo_id="u/r", work_dir=tmp_path / "work", upload_raw=False)
+    records, waves = records_and_waves()
+
+    first = store.write_source("ibrahim-aldosari", "087", records, waves)
+    second = store.write_source("ibrahim-aldosari", "087", records, waves)
+    assert first == second == "data/ibrahim-aldosari/087.parquet"
+
+
+def test_local_staging_file_is_removed(fake_api, tmp_path):
+    work = tmp_path / "work"
+    store = HubStore(repo_id="u/r", work_dir=work, upload_raw=False)
+    records, waves = records_and_waves()
+
+    store.write_source("ibrahim-aldosari", "087", records, waves)
+    assert list(work.glob("*.parquet")) == []
+
+
+def test_staging_file_is_removed_even_when_the_commit_fails(fake_api, tmp_path):
+    work = tmp_path / "work"
+    store = HubStore(repo_id="u/r", work_dir=work, upload_raw=False)
+
+    def boom(**kwargs):
+        raise OSError("network down")
+
+    store.api.create_commit = boom
+    records, waves = records_and_waves()
+
+    with pytest.raises(OSError):
+        store.write_source("ibrahim-aldosari", "087", records, waves)
+    assert list(work.glob("*.parquet")) == []
+    assert store.sources_written == 0
+
+
+def test_done_sources_reads_filenames_only(fake_api, tmp_path):
+    fake_api.files = [
+        "README.md",
+        "segment_params.json",
+        "data/ibrahim-aldosari/087.parquet",
+        "data/ibrahim-aldosari/002.parquet",
+        "data/rachid-belalya/114.parquet",
+        "raw/ibrahim-aldosari/087.mp3",
+    ]
+    store = HubStore(repo_id="u/r", work_dir=tmp_path)
+    assert store.done_sources() == {
+        "ibrahim-aldosari/087",
+        "ibrahim-aldosari/002",
+        "rachid-belalya/114",
+    }
+
+
+def test_done_sources_is_empty_when_the_repo_cannot_be_listed(fake_api, tmp_path):
+    store = HubStore(repo_id="u/r", work_dir=tmp_path)
+
+    def boom(*args, **kwargs):
+        raise OSError("offline")
+
+    store.api.list_repo_files = boom
+    assert store.done_sources() == set()
 
 
 def test_readme_written_once(fake_api, tmp_path):
-    HubWriter(repo_id="u/r", work_dir=tmp_path)
+    HubStore(repo_id="u/r", work_dir=tmp_path)
     assert fake_api.uploads.count("README.md") == 1
-    HubWriter(repo_id="u/r", work_dir=tmp_path)
+    HubStore(repo_id="u/r", work_dir=tmp_path)
     assert fake_api.uploads.count("README.md") == 1
 
 
-def test_sources_are_committed_in_one_batch(fake_api, tmp_path):
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path)
-    for i in range(5):
-        path = tmp_path / f"{i:03d}.mp3"
-        path.write_bytes(b"x")
-        writer.queue_source(path, "ibrahim-aldosari")
+def test_parquet_contents_and_audio(tmp_path):
+    records, waves = records_and_waves(n=2)
+    records[0].update(start_sample=198400, end_sample=214400,
+                      start_seconds=12.4, end_seconds=13.4)
+    local = build_parquet(records, waves, tmp_path / "s.parquet")
 
-    assert writer.flush_sources() == 5
-    # One commit, not five: a full pass would otherwise be thousands.
-    assert len(fake_api.commits) == 1
-    assert fake_api.commits[0] == [f"raw/ibrahim-aldosari/{i:03d}.mp3" for i in range(5)]
+    rows = pq.read_table(local).to_pylist()
+    assert [r["segment_id"] for r in rows] == [
+        "ibrahim-aldosari__087__0000", "ibrahim-aldosari__087__0001",
+    ]
+    # Timestamps live in the filename; the id stays put.
+    assert rows[0]["audio"]["path"] == "ibrahim-aldosari__087__0000__12400-13400ms.flac"
 
-
-def test_flush_sources_is_a_noop_when_nothing_queued(fake_api, tmp_path):
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path)
-    assert writer.flush_sources() == 0
-    assert fake_api.commits == []
+    data, sr = sf.read(io.BytesIO(rows[0]["audio"]["bytes"]), dtype="float32")
+    assert (sr, len(data)) == (16000, 4000)
 
 
-def test_no_raw_suppresses_source_upload(fake_api, tmp_path):
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, upload_raw=False)
-    path = tmp_path / "001.mp3"
-    path.write_bytes(b"x")
-    writer.queue_source(path, "r")
-    assert writer.flush_sources() == 0
+def test_build_parquet_rejects_mismatched_inputs(tmp_path):
+    records, waves = records_and_waves(n=3)
+    with pytest.raises(ValueError):
+        build_parquet(records, waves[:2], tmp_path / "s.parquet")
+    with pytest.raises(ValueError):
+        build_parquet([], [], tmp_path / "s.parquet")
 
 
-def test_clip_filename_carries_timestamps_but_id_does_not(fake_api, tmp_path, keep_shards):
-    import pyarrow.parquet as pq
-
-    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=10**9)
-    writer.add(
-        make_record(3, start_sample=198400, end_sample=214400,
-                    start_seconds=12.4, end_seconds=13.4),
-        make_wave(1.0),
-    )
-    writer.flush()
-
-    table = pq.read_table(next(tmp_path.glob("*.parquet")))
-    row = table.to_pylist()[0]
-    assert row["segment_id"] == "ibrahim-aldosari__087__0003"
-    assert row["audio"]["path"] == "ibrahim-aldosari__087__0003__12400-13400ms.flac"
-
-    data, sr = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
-    assert (sr, len(data)) == (16000, 16000)
-
-
-def test_done_sources_on_hub_is_empty_when_shards_cannot_be_read(monkeypatch):
-    import warshdata.hub as hub
-
-    def boom(*args, **kwargs):
-        raise OSError("no such repo")
-
-    monkeypatch.setattr(hub, "shard_sources", boom)
-    assert hub.done_sources_on_hub("u/does-not-exist") == set()
-
-
-def test_done_sources_comes_from_the_shards_not_the_manifest(monkeypatch):
-    """Resuming off the manifest marks sources done that hold no audio; they are
-    then skipped for good. The shards are the corpus, so they decide."""
-    import collections
-
-    import warshdata.hub as hub
-
-    monkeypatch.setattr(
-        hub, "shard_sources",
-        lambda repo_id, token=None: collections.Counter({"r/001": 12, "r/002": 8}),
-    )
-    # A manifest claiming more than the shards hold must not widen the result.
-    assert hub.done_sources_on_hub("u/r") == {"r/001", "r/002"}
-
-
-def test_manifest_sources_on_hub_still_readable(monkeypatch, tmp_path):
-    import json
-
-    import huggingface_hub
-
-    manifest = tmp_path / "segments.jsonl"
-    manifest.write_text(
-        json.dumps(make_record(0)) + "\n"
-        + json.dumps(make_record(2, source_id="other/002")) + "\n"
-        + "{torn line\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **k: str(manifest))
-    from warshdata.hub import manifest_sources_on_hub
-
-    assert manifest_sources_on_hub("u/r") == {"ibrahim-aldosari/087", "other/002"}
+def test_upload_params(fake_api, tmp_path):
+    store = HubStore(repo_id="u/r", work_dir=tmp_path)
+    store.upload_params({"model_id": "obadx/recitation-segmenter-v2", "batch_size": 16})
+    assert "segment_params.json" in fake_api.uploads

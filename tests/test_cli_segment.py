@@ -90,64 +90,52 @@ def fake_segment_module(monkeypatch):
     return calls
 
 
-class RecordingWriter:
-    """Stands in for HubWriter and logs the order of operations."""
+class RecordingStore:
+    """Stands in for HubStore and records every published source."""
 
-    instances: list["RecordingWriter"] = []
+    instances: list["RecordingStore"] = []
+    fail_on: set[str] = set()
 
-    def __init__(self, repo_id=None, work_dir=None, shard_bytes=None, private=False, upload_raw=True):
+    def __init__(self, repo_id=None, work_dir=None, private=False, upload_raw=True):
         self.repo_id = repo_id
         self.upload_raw = upload_raw
-        self.added: list[str] = []
-        self.flushed: list[str] = []
-        self.queued: list[str] = []
-        self.events: list[str] = []
+        self.published: list[str] = []
+        self.commits: list[list[str]] = []
         self.rows_written = 0
-        self.shards_written = 0
-        RecordingWriter.instances.append(self)
+        self.sources_written = 0
+        self.params = None
+        self.existing: set[str] = set()
+        RecordingStore.instances.append(self)
 
-    def repo_files(self):
-        return []
+    def done_sources(self):
+        return set(self.existing)
 
-    def add(self, record, wave):
-        self.added.append(record["segment_id"])
-        self.rows_written += 1
+    def upload_params(self, params):
+        self.params = params
 
-    def queue_source(self, path, slug):
-        self.queued.append(f"raw/{slug}/{Path(path).name}")
-
-    #: rows buffered before a flush is reported; None means never flush early
-    flush_after: int | None = None
-
-    def flush(self):
-        self.events.append("flush")
-        self.shards_written += 1
-        self.flushed = list(self.added)
-        return "shard-00000.parquet"
-
-    def maybe_flush(self):
-        if self.flush_after is not None and len(self.added) - len(self.flushed) >= self.flush_after:
-            return self.flush()
-        return None
-
-    def flush_sources(self):
-        self.events.append("flush_sources")
-        n = len(self.queued)
-        self.queued = []
-        return n
-
-    def push_manifest(self, path):
-        self.events.append("push_manifest")
+    def write_source(self, reciter_slug, source_stem, records, waves, raw_path=None):
+        source_id = f"{reciter_slug}/{source_stem}"
+        if source_id in RecordingStore.fail_on:
+            raise OSError("upload refused")
+        assert len(records) == len(waves), "one waveform per record"
+        paths = [f"data/{reciter_slug}/{source_stem}.parquet"]
+        if self.upload_raw and raw_path is not None:
+            paths.append(f"raw/{reciter_slug}/{Path(raw_path).name}")
+        self.commits.append(paths)
+        self.published.append(source_id)
+        self.rows_written += len(records)
+        self.sources_written += 1
+        return paths[0]
 
 
 @pytest.fixture
 def fake_hub(monkeypatch):
     import warshdata.hub as hub
 
-    RecordingWriter.instances = []
-    monkeypatch.setattr(hub, "HubWriter", RecordingWriter)
-    monkeypatch.setattr(hub, "done_sources_on_hub", lambda *a, **k: set())
-    return RecordingWriter
+    RecordingStore.instances = []
+    RecordingStore.fail_on = set()
+    monkeypatch.setattr(hub, "HubStore", RecordingStore)
+    return RecordingStore
 
 
 def make_audio_tree(root: Path, reciters=("ibrahim-aldosari",), surahs=(1, 2, 3)):
@@ -216,66 +204,6 @@ def test_missing_input_is_an_error(tmp_path):
     assert run(["segment", str(tmp_path / "nope"), "-o", str(tmp_path / "out")]) == 1
 
 
-def test_final_flush_happens(fake_segment_module, fake_hub, tmp_path):
-    """Regression: the end-of-run flush was missing, so the last partial shard,
-    the trailing raw files and the closing manifest push were all dropped."""
-    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
-    out = tmp_path / "out"
-
-    run(["segment", str(audio), "-o", str(out), "--no-clips",
-         "--push-to", "u/r", "--push-every", "10"])
-
-    writer = fake_hub.instances[0]
-    # 3 sources, push-every 10 -> nothing would be pushed without the final flush
-    assert writer.events[-3:] == ["flush", "flush_sources", "push_manifest"]
-    assert writer.rows_written == 9
-    assert writer.queued == []
-
-
-def test_push_every_throttles_intermediate_commits(fake_segment_module, fake_hub, tmp_path):
-    audio = make_audio_tree(tmp_path / "audio", surahs=tuple(range(1, 7)))
-    out = tmp_path / "out"
-
-    run(["segment", str(audio), "-o", str(out), "--no-clips",
-         "--push-to", "u/r", "--push-every", "2"])
-
-    writer = fake_hub.instances[0]
-    # No shard ever filled, so the manifest is pushed only by the final flush.
-    assert writer.events.count("push_manifest") == 1
-    assert writer.events.count("flush") == 1
-    # Raw files still commit on the --push-every schedule.
-    assert writer.events.count("flush_sources") >= 3
-
-
-def test_every_segment_reaches_the_writer(fake_segment_module, fake_hub, tmp_path):
-    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2))
-    out = tmp_path / "out"
-
-    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
-
-    writer = fake_hub.instances[0]
-    assert len(writer.added) == 6
-    assert len(set(writer.added)) == 6, "segment ids must be unique across sources"
-
-
-def test_resume_queues_raw_files_missing_from_the_hub(fake_segment_module, fake_hub, tmp_path):
-    """A session that died between batch commits leaves sources in the manifest
-    with no raw file; they are excluded from `pending`, so they must be queued
-    explicitly or they never upload at all."""
-    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
-    out = tmp_path / "out"
-
-    run(["segment", str(audio), "-o", str(out), "--no-clips"])  # local only
-    run(["segment", str(audio), "-o", str(out), "--no-clips",
-         "--push-to", "u/r", "--resume"])
-
-    writer = fake_hub.instances[0]
-    # All three were already segmented, so none are re-processed, but their raw
-    # files are absent from the (empty) repo listing and must still be sent.
-    assert writer.events.count("flush_sources") >= 1
-    assert writer.rows_written == 0
-
-
 def test_failure_on_one_source_does_not_end_the_run(fake_segment_module, tmp_path, monkeypatch):
     audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
     out = tmp_path / "out"
@@ -293,53 +221,6 @@ def test_failure_on_one_source_does_not_end_the_run(fake_segment_module, tmp_pat
     assert run(["segment", str(audio), "-o", str(out), "--no-clips"]) == 0
     records = list(manifest.read(out / "segments.jsonl"))
     assert {r["source_id"].split("/")[-1] for r in records} == {"001", "003"}
-
-
-def test_manifest_is_never_pushed_ahead_of_the_shards(fake_segment_module, fake_hub, tmp_path):
-    """The invariant resumption rests on.
-
-    ``done_sources_on_hub`` reads the uploaded manifest and skips those sources
-    for good.  If the manifest is ever uploaded while segments are still sitting
-    in the write buffer, those sources are marked done, skipped on the next run,
-    and their audio is uploaded by nobody -- rows naming audio that exists
-    nowhere.  So every manifest push must be immediately preceded by a flush.
-    """
-    audio = make_audio_tree(tmp_path / "audio", surahs=tuple(range(1, 9)))
-    out = tmp_path / "out"
-
-    fake_hub.flush_after = 6          # a shard fills every 2 sources (3 segs each)
-    try:
-        run(["segment", str(audio), "-o", str(out), "--no-clips",
-             "--push-to", "u/r", "--push-every", "1"])
-    finally:
-        fake_hub.flush_after = None
-
-    writer = fake_hub.instances[0]
-    events = writer.events
-    assert "push_manifest" in events
-    for i, event in enumerate(events):
-        if event == "push_manifest":
-            assert "flush" in events[max(0, i - 2):i], (
-                f"push_manifest at {i} without a preceding flush: {events}"
-            )
-    # And nothing is left buffered at the end.
-    assert writer.flushed == writer.added
-
-
-def test_raw_commits_do_not_drag_the_manifest_with_them(fake_segment_module, fake_hub, tmp_path):
-    """--push-every governs raw provenance files only; it must not push the
-    manifest, which is tied to shard flushes."""
-    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3, 4))
-    out = tmp_path / "out"
-
-    run(["segment", str(audio), "-o", str(out), "--no-clips",
-         "--push-to", "u/r", "--push-every", "1"])
-
-    writer = fake_hub.instances[0]
-    # 4 sources -> 4 raw commits, but no shard ever filled, so the only manifest
-    # push is the final one.
-    assert writer.events.count("flush_sources") >= 4
-    assert writer.events.count("push_manifest") == 1
 
 
 def test_sources_file_overrides_resume(fake_segment_module, tmp_path):
@@ -369,3 +250,97 @@ def test_sources_file_warns_about_unknown_ids(fake_segment_module, tmp_path, cap
     run(["segment", str(audio), "-o", str(out), "--no-clips", "--sources-file", str(listing)])
     err = capsys.readouterr().err
     assert "not found" in err and "nobody/999" in err
+
+
+def test_each_source_is_one_commit(fake_segment_module, fake_hub, tmp_path):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
+
+    store = fake_hub.instances[0]
+    assert store.published == [
+        "ibrahim-aldosari/001", "ibrahim-aldosari/002", "ibrahim-aldosari/003",
+    ]
+    # Parquet and mp3 travel together, one commit per source.
+    assert all(len(c) == 2 for c in store.commits)
+    assert store.rows_written == 9
+
+
+def test_resume_uses_the_published_files(fake_segment_module, fake_hub, tmp_path):
+    """Resume asks the repo what exists; nothing else can contradict it."""
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
+    out = tmp_path / "out"
+
+    class Preloaded(RecordingStore):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.existing = {"ibrahim-aldosari/001", "ibrahim-aldosari/002"}
+
+    import warshdata.hub as hub
+
+    hub.HubStore = Preloaded
+    try:
+        run(["segment", str(audio), "-o", str(out), "--no-clips",
+             "--push-to", "u/r", "--resume"])
+    finally:
+        hub.HubStore = RecordingStore
+
+    store = RecordingStore.instances[-1]
+    assert store.published == ["ibrahim-aldosari/003"]
+
+
+def test_a_failed_upload_leaves_the_source_unpublished(fake_segment_module, fake_hub, tmp_path):
+    """The failed source is simply absent, so a later resume retries it --
+    there is no partial state to detect or clean up."""
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3))
+    out = tmp_path / "out"
+
+    fake_hub.fail_on = {"ibrahim-aldosari/002"}
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
+
+    store = fake_hub.instances[0]
+    assert store.published == ["ibrahim-aldosari/001", "ibrahim-aldosari/003"]
+    # The manifest must not claim the source that never uploaded.
+    ids = {r["source_id"] for r in manifest.read(out / "segments.jsonl")}
+    assert ids == {"ibrahim-aldosari/001", "ibrahim-aldosari/003"}
+
+
+def test_manifest_never_records_a_source_that_failed_to_publish(fake_segment_module,
+                                                               fake_hub, tmp_path):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    out = tmp_path / "out"
+    fake_hub.fail_on = {"ibrahim-aldosari/001"}
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
+    assert list(manifest.read(out / "segments.jsonl")) == []
+
+
+def test_rerunning_the_same_source_republishes_the_same_path(fake_segment_module,
+                                                             fake_hub, tmp_path):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
+
+    first, second = fake_hub.instances
+    assert first.commits[0][0] == second.commits[0][0] == "data/ibrahim-aldosari/001.parquet"
+
+
+def test_params_are_published(fake_segment_module, fake_hub, tmp_path):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--push-to", "u/r"])
+    store = fake_hub.instances[0]
+    assert store.params["model_id"] == "obadx/recitation-segmenter-v2"
+    assert store.params["resolved_dtype"] == "float16"
+
+
+def test_dry_run_never_touches_the_hub(fake_segment_module, fake_hub, tmp_path):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--push-to", "u/r", "--dry-run"])
+    assert fake_hub.instances == []

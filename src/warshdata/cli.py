@@ -28,31 +28,16 @@ def cmd_segment(args: argparse.Namespace) -> int:
         print(f"No audio found under {args.input}", file=sys.stderr)
         return 1
 
-    writer = None
+    store = None
     if args.push_to and not args.dry_run:
-        from .hub import HubWriter, done_sources_on_hub
+        from .hub import HubStore
 
-        writer = HubWriter(
+        store = HubStore(
             repo_id=args.push_to,
-            work_dir=out_dir / "_shards",
-            shard_bytes=int(args.shard_mb * 1024 * 1024),
+            work_dir=out_dir / "_staging",
             private=args.private,
             upload_raw=not args.no_raw,
         )
-
-    already = manifest.done_sources(manifest_path) if args.resume else set()
-    if writer is not None and args.resume:
-        # Resuming across Colab sessions: the local manifest is gone but the
-        # hub one is not, so ask the hub what has already been done.
-        already |= done_sources_on_hub(args.push_to)
-    if writer is not None and writer.upload_raw:
-        # A source segmented in a session that died before its batch commit
-        # is in the manifest but has no raw file. It is excluded from
-        # `pending`, so queue it here or it is never uploaded at all.
-        on_hub = set(writer.repo_files())
-        for s in sources:
-            if s.source_id in already and f"raw/{s.reciter_slug}/{s.path.name}" not in on_hub:
-                writer.queue_source(s.path, s.reciter_slug)
 
     if args.sources_file:
         wanted = {
@@ -60,36 +45,38 @@ def cmd_segment(args: argparse.Namespace) -> int:
             for line in Path(args.sources_file).read_text(encoding="utf-8").splitlines()
             if line.strip()
         }
-        # These are being re-segmented deliberately, so `already` must not veto
-        # them -- being listed in the manifest is exactly why they are here.
         pending = [s for s in sources if s.source_id in wanted]
         unknown = wanted - {s.source_id for s in sources}
         if unknown:
-            print(f"warning: {len(unknown)} source id(s) not found in {args.input}", file=sys.stderr)
-            for u in sorted(unknown)[:10]:
-                print(f"  {u}", file=sys.stderr)
+            print(f"warning: {len(unknown)} source id(s) not found under {args.input}",
+                  file=sys.stderr)
+            for name in sorted(unknown)[:10]:
+                print(f"  {name}", file=sys.stderr)
+        already: set[str] = set()
     else:
+        already = manifest.done_sources(manifest_path) if args.resume else set()
+        if store is not None and args.resume:
+            # The published files are the authority on what is done.  The path
+            # encodes the source, so this is a listing, not a download.
+            already |= store.done_sources()
         pending = [s for s in sources if s.source_id not in already]
+
     if args.limit:
         pending = pending[: args.limit]
 
-    print(f"Found {len(sources)} recording(s); {len(already)} already done; {len(pending)} to process.")
+    print(f"Found {len(sources)} recording(s); {len(already)} already done; "
+          f"{len(pending)} to process.")
 
     if args.dry_run:
-        for s in pending:
-            print(f"  {s.source_id}  <-  {s.path}")
+        for source in pending:
+            print(f"  {source.source_id}  <-  {source.path}")
         return 0
 
     if not pending:
-        # Nothing to segment, but an earlier session may still have left raw
-        # files unsent -- returning here without flushing would strand them.
-        if writer is not None:
-            writer.flush_sources()
         return 0
 
-    # Imported here rather than at module scope: this is the only path that
-    # needs torch, so --help, --dry-run and a bad input path stay usable
-    # without the model stack installed.
+    # Imported here rather than at module scope: this is the only path needing
+    # torch, so --help, --dry-run and a bad input stay usable without it.
     from .segment import MODEL_ID, SegmentParams, Segmenter
 
     params = SegmentParams(
@@ -101,64 +88,53 @@ def cmd_segment(args: argparse.Namespace) -> int:
         device=args.device,
         dtype=args.dtype,
     )
-
     segmenter = Segmenter(params)
 
-    # Record the dtype that was actually used, not the literal "auto" -- the
-    # point of this file is that a manifest can be reproduced from it.
-    manifest.write_params(
-        params_path,
-        {
-            "model_id": MODEL_ID,
-            "warsh_data_version": __version__,
-            **asdict(params),
-            "resolved_dtype": str(segmenter.dtype).replace("torch.", ""),
-        },
-    )
+    settings = {
+        "model_id": MODEL_ID,
+        "warsh_data_version": __version__,
+        **asdict(params),
+        "resolved_dtype": str(segmenter.dtype).replace("torch.", ""),
+    }
+    manifest.write_params(params_path, settings)
+    if store is not None:
+        store.upload_params(settings)
 
     total, failures = 0, 0
     for n, source in enumerate(pending, start=1):
         try:
-            records, _wave = segmenter.segment(source, clips_dir=clips_dir)
-        except Exception as exc:  # one unreadable file must not end the run
+            records, wave = segmenter.segment(source, clips_dir=clips_dir)
+            if not records:
+                raise RuntimeError("no speech intervals found")
+
+            if store is not None:
+                # One source, one commit: the parquet and the mp3 that produced
+                # it land together or not at all.
+                store.write_source(
+                    reciter_slug=source.reciter_slug,
+                    source_stem=source.path.stem,
+                    records=[asdict(r) for r in records],
+                    waves=[wave[r.start_sample : r.end_sample].numpy() for r in records],
+                    raw_path=source.path,
+                )
+        except Exception as exc:
+            # This source is simply absent from the repo, so a later --resume
+            # retries it.  Nothing partial is left behind to clean up.
             failures += 1
-            print(f"[{n}/{len(pending)}] FAILED {source.source_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"[{n}/{len(pending)}] FAILED {source.source_id}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
             continue
 
-        # Written per source, so an interrupted run resumes at file granularity.
         manifest.append(manifest_path, records)
         total += len(records)
-
-        if writer is not None:
-            for rec in records:
-                writer.add(asdict(rec), _wave[rec.start_sample : rec.end_sample].numpy())
-            writer.queue_source(source.path, source.reciter_slug)
-
-            # The manifest is uploaded only right after a shard flush, so it can
-            # never name a source whose audio is still buffered.  Anything else
-            # marks sources done that no shard holds, and resume then skips them
-            # for good.
-            if writer.maybe_flush() is not None:
-                writer.flush_sources()
-                writer.push_manifest(manifest_path)
-            elif n % args.push_every == 0:
-                # Raw files are provenance only, so they commit on their own
-                # schedule without touching the manifest.
-                writer.flush_sources()
-        flag = "" if (records and records[0].source_is_complete) else "  [incomplete: last segment is not waqf-bounded]"
+        flag = "" if records[0].source_is_complete else "  [incomplete: last segment not waqf-bounded]"
         print(f"[{n}/{len(pending)}] {source.source_id}: {len(records)} segments{flag}")
 
-    if writer is not None:
-        # The last shard is almost never exactly full, and the last few
-        # sources sit below the push-every threshold -- without this they
-        # are simply never uploaded.
-        writer.flush()
-        writer.flush_sources()
-        writer.push_manifest(manifest_path)
-        print(f"Pushed {writer.rows_written} segments in {writer.shards_written} "
-              f"shard(s) to {args.push_to}")
-
-    print(f"\nWrote {total} segments to {manifest_path}" + (f" ({failures} file(s) failed)" if failures else ""))
+    if store is not None:
+        print(f"Published {store.rows_written} segments from {store.sources_written} "
+              f"source(s) to {args.push_to}")
+    print(f"Wrote {total} segments to {manifest_path}"
+          + (f" ({failures} source(s) failed)" if failures else ""))
     return 0
 
 
@@ -304,89 +280,18 @@ def cmd_apply_corrections(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_verify(args: argparse.Namespace) -> int:
-    """Check that every source named in the hub manifest has audio in a shard."""
-    from huggingface_hub import hf_hub_download
+def cmd_manifest(args: argparse.Namespace) -> int:
+    """Build a manifest from a repo's shards, reading no audio."""
+    from .hub import read_rows
 
-    from .hub import manifest_sources, shard_sources
-
-    if args.manifest:
-        manifest_path = Path(args.manifest)
-    else:
-        print(f"Fetching manifest from {args.repo} ...")
-        manifest_path = Path(
-            hf_hub_download(
-                repo_id=args.repo, filename="manifests/segments.jsonl", repo_type="dataset"
-            )
-        )
-
-    man = manifest_sources(manifest_path)
-    print(f"Manifest : {sum(man.values())} segments across {len(man)} sources")
-
-    print(f"Reading shard source_id columns from {args.repo} ...")
-    shards = shard_sources(args.repo)
-    print(f"Shards   : {sum(shards.values())} segments across {len(shards)} sources")
-
-    missing = sorted(s for s in man if shards.get(s, 0) == 0)
-    partial = sorted(s for s in man if 0 < shards.get(s, 0) < man[s])
-    orphan = sorted(s for s in shards if s not in man)
-
-    print()
-    print(f"Sources in the manifest with NO audio in any shard : {len(missing)}")
-    print(f"Sources only partly present in the shards          : {len(partial)}")
-    print(f"Sources in shards but not in the manifest          : {len(orphan)}")
-
-    for label, items in (("missing", missing), ("partial", partial)):
-        for src in items[:15]:
-            print(f"  {label:<8} {src:<32} manifest {man[src]:>5}  shards {shards.get(src, 0):>5}")
-        if len(items) > 15:
-            print(f"  ... and {len(items) - 15} more")
-
-    broken = missing + partial
-    if args.write_missing and broken:
-        out = Path(args.write_missing)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("\n".join(broken) + "\n", encoding="utf-8")
-        print(f"\nWrote {len(broken)} source id(s) to {out}")
-        print(f"Re-segment them with:  warsh-data segment <audio> --sources-file {out} ...")
-
-    if broken:
-        print("\nThese sources are named in the manifest but their audio is absent, so a")
-        print("plain --resume would skip them for good. Re-segment them explicitly.")
-        return 1
-
-    print("\nClean: every source in the manifest has all of its audio in the shards.")
-    return 0
-
-
-def cmd_purge(args: argparse.Namespace) -> int:
-    """Remove every row for the given sources from the shards."""
-    from .hub import purge_sources
-
-    sources = {
-        line.strip()
-        for line in Path(args.sources_file).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    }
-    if not sources:
-        print(f"No source ids in {args.sources_file}", file=sys.stderr)
-        return 1
-
-    print(f"Purging {len(sources)} source(s) from {args.repo}"
-          + ("  [dry run]" if args.dry_run else ""))
-    report = purge_sources(
-        args.repo, sources, work_dir=Path(args.work_dir), dry_run=args.dry_run
-    )
-
-    for name, removed, kept in report["rewritten"]:
-        print(f"  {name}: removed {removed}, kept {kept}")
-    for name in report["deleted"]:
-        print(f"  {name}: deleted (empty after purge)")
-    print(f"\nScanned {report['scanned']} shard(s); removed {report['rows_removed']} row(s)")
-
-    if not args.dry_run and report["rows_removed"]:
-        print(f"Now re-segment them:  warsh-data segment <audio> "
-              f"--sources-file {args.sources_file} --push-to {args.repo}")
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with out.open("w", encoding="utf-8") as fh:
+        for row in read_rows(args.repo):
+            fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
+            count += 1
+    print(f"Wrote {count} rows to {out}")
     return 0
 
 
@@ -411,12 +316,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-duration-ms", type=int, default=19995)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--push-to", metavar="REPO_ID", help="stream shards to this HF dataset repo as they fill")
-    p.add_argument("--shard-mb", type=int, default=100,
-                   help="audio MB per parquet shard (default: 100); also how much work a crash costs, so bigger is not better on a flaky session")
     p.add_argument("--private", action="store_true", help="create the HF dataset repo private")
     p.add_argument("--no-raw", action="store_true", help="do not upload the source mp3s")
-    p.add_argument("--push-every", type=int, default=10,
-                   help="commit the manifest and queued sources every N recordings (default: 10)")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto",
                    help="auto: bfloat16 where supported, float16 on older GPUs (e.g. T4), float32 on CPU")
@@ -434,18 +335,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also fetch Warsh via Tariq al-Asbahani, whose pronunciation differs")
     p.set_defaults(func=cmd_fetch)
 
-    p = sub.add_parser("verify", help="check the hub manifest against the shards")
+    p = sub.add_parser("manifest", help="build a manifest from a published repo")
     p.add_argument("repo", help="HF dataset repo id")
-    p.add_argument("--manifest", help="use a local manifest instead of downloading it")
-    p.add_argument("--write-missing", metavar="PATH", help="write broken source ids to this file")
-    p.set_defaults(func=cmd_verify)
-
-    p = sub.add_parser("purge", help="delete a source's rows from the shards")
-    p.add_argument("repo", help="HF dataset repo id")
-    p.add_argument("sources_file", help="file of source ids, one per line")
-    p.add_argument("--work-dir", default="./_purge", help="scratch dir for shard rewrites")
-    p.add_argument("--dry-run", action="store_true", help="report what would change and exit")
-    p.set_defaults(func=cmd_purge)
+    p.add_argument("-o", "--output", default="./segments.jsonl")
+    p.set_defaults(func=cmd_manifest)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")
