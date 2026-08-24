@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__, manifest
-from .segment import MODEL_ID, SegmentParams, Segmenter
 from .sources import discover
+
+# ``segment`` pulls in torch and transformers.  It is imported inside the segment
+# command so that ``stats``, ``--dry-run`` and ``--help`` work on a machine with
+# only the manifest and no model stack installed.
 
 
 def cmd_segment(args: argparse.Namespace) -> int:
+    from .segment import MODEL_ID, SegmentParams, Segmenter
+
     out_dir = Path(args.output)
     manifest_path = out_dir / "segments.jsonl"
     params_path = out_dir / "segment_params.json"
