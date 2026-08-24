@@ -22,8 +22,17 @@ FLAC rather than WAV because it is lossless and roughly half the size; lossless
 rather than Opus because the source is already lossy mp3 and a second generation
 of loss is not worth the saving at this corpus size.
 
-Shards are flushed and uploaded as they fill.  A Colab session that dies loses
-at most the partial shard in flight, and local disk never grows past one shard.
+Shards are flushed and uploaded as they fill, but only ever at a *source*
+boundary, and the manifest is uploaded only immediately after a successful
+shard flush.  Together those two rules give the invariant that resumption
+depends on:
+
+    every source named in the hub manifest has all of its audio in a shard
+
+Without it, a manifest listing segments still sitting in the write buffer marks
+those sources done, they are skipped on resume, and their audio is never
+uploaded by anyone -- rows in the manifest pointing at audio that exists
+nowhere.  A crash now costs re-segmenting up to one shard, never data.
 """
 
 from __future__ import annotations
@@ -192,6 +201,7 @@ class HubWriter:
         return max(used) + 1 if used else 0
 
     def add(self, record: Dict[str, Any], wave: np.ndarray) -> None:
+        """Buffer one segment.  Never flushes -- see :meth:`maybe_flush`."""
         row = dict(record)
         audio_bytes = encode_flac(wave)
         from .sources import clip_name
@@ -202,8 +212,19 @@ class HubWriter:
         row["audio"] = {"bytes": audio_bytes, "path": f"{name}.flac"}
         self._rows.append(row)
         self._buffered += len(audio_bytes)
+
+    def maybe_flush(self) -> Optional[str]:
+        """Flush if the buffer is full.  Call only at a source boundary.
+
+        Flushing mid-source would put some of a source's segments in a shard and
+        leave the rest buffered; the manifest would then mark that source done
+        while part of its audio had gone nowhere.  Shards may overshoot
+        ``shard_bytes`` by up to one recording, which is the price of the
+        invariant and is cheap.
+        """
         if self._buffered >= self.shard_bytes:
-            self.flush()
+            return self.flush()
+        return None
 
     def flush(self) -> Optional[str]:
         """Write and upload the buffered rows as one shard."""

@@ -118,11 +118,18 @@ def cmd_segment(args: argparse.Namespace) -> int:
             for rec in records:
                 writer.add(asdict(rec), _wave[rec.start_sample : rec.end_sample].numpy())
             writer.queue_source(source.path, source.reciter_slug)
-            # Throttled: one manifest commit per source would be thousands of
-            # commits over a full pass.
-            if n % args.push_every == 0:
+
+            # The manifest is uploaded only right after a shard flush, so it can
+            # never name a source whose audio is still buffered.  Anything else
+            # marks sources done that no shard holds, and resume then skips them
+            # for good.
+            if writer.maybe_flush() is not None:
                 writer.flush_sources()
                 writer.push_manifest(manifest_path)
+            elif n % args.push_every == 0:
+                # Raw files are provenance only, so they commit on their own
+                # schedule without touching the manifest.
+                writer.flush_sources()
         flag = "" if (records and records[0].source_is_complete) else "  [incomplete: last segment is not waqf-bounded]"
         print(f"[{n}/{len(pending)}] {source.source_id}: {len(records)} segments{flag}")
 

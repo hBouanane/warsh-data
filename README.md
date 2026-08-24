@@ -121,9 +121,22 @@ warsh-data segment ./audio -o ./out --push-to <user>/warsh-segments-v2 --resume
 ```
 
 Segments stream into parquet shards and upload as each fills, so local disk never
-grows past one shard and a dead session loses at most the shard in flight.
-`--resume` reads the *manifest* from the Hub -- a few MB, not the corpus -- so a
-run continues across sessions.
+grows past one shard. `--resume` reads the *manifest* from the Hub -- a few MB,
+not the corpus -- so a run continues across sessions.
+
+The invariant that makes resume safe:
+
+> every source named in the hub manifest has all of its audio in a shard
+
+Two rules enforce it. Shards flush only at a **source boundary** (so a source's
+segments are never split between a shard and the buffer), and the manifest is
+uploaded only **immediately after a successful shard flush**. Without both, a
+manifest can name sources whose audio is still buffered; resume then skips them
+permanently and their audio is uploaded by nobody. A crash costs re-segmenting up
+to one shard, never data.
+
+`--push-every` governs the raw provenance files only, which commit on their own
+schedule and never drag the manifest with them.
 
 Repo layout:
 

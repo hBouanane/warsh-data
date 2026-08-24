@@ -22,18 +22,38 @@ def test_encode_flac_round_trips():
     assert np.abs(data - wave).max() < 2e-4
 
 
-def test_shard_flushes_when_full_and_deletes_local_copy(fake_api, tmp_path):
+def test_add_never_flushes_on_its_own(fake_api, tmp_path):
+    """Flushing mid-source would strand the rest of that source's audio."""
+    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=1)
+    for i in range(5):
+        writer.add(make_record(i), make_wave(1.0, seed=i))
+    assert [f for f in fake_api.uploads if f.startswith("data/")] == []
+    assert writer.rows_written == 0
+
+
+def test_maybe_flush_writes_when_full(fake_api, tmp_path):
     writer = HubWriter(repo_id="u/r", work_dir=tmp_path / "_shards", shard_bytes=60_000)
+    shards_seen = 0
     for i in range(12):
         writer.add(make_record(i), make_wave(1.0, seed=i))
+        if writer.maybe_flush() is not None:      # called at a source boundary
+            shards_seen += 1
     writer.flush()
 
     shards = [f for f in fake_api.uploads if f.startswith("data/")]
-    assert len(shards) >= 2, "buffer should have flushed more than once"
+    assert shards_seen >= 1, "buffer should have filled at least once"
+    assert len(shards) >= 2
     assert shards == sorted(shards), "shards must be uploaded in order"
     assert writer.rows_written == 12
     # The point of streaming: nothing accumulates on disk.
     assert list((tmp_path / "_shards").glob("*.parquet")) == []
+
+
+def test_maybe_flush_is_a_noop_below_the_threshold(fake_api, tmp_path):
+    writer = HubWriter(repo_id="u/r", work_dir=tmp_path, shard_bytes=10**9)
+    writer.add(make_record(0), make_wave(1.0))
+    assert writer.maybe_flush() is None
+    assert [f for f in fake_api.uploads if f.startswith("data/")] == []
 
 
 def test_flush_is_a_noop_when_empty(fake_api, tmp_path):

@@ -99,6 +99,7 @@ class RecordingWriter:
         self.repo_id = repo_id
         self.upload_raw = upload_raw
         self.added: list[str] = []
+        self.flushed: list[str] = []
         self.queued: list[str] = []
         self.events: list[str] = []
         self.rows_written = 0
@@ -115,10 +116,19 @@ class RecordingWriter:
     def queue_source(self, path, slug):
         self.queued.append(f"raw/{slug}/{Path(path).name}")
 
+    #: rows buffered before a flush is reported; None means never flush early
+    flush_after: int | None = None
+
     def flush(self):
         self.events.append("flush")
         self.shards_written += 1
+        self.flushed = list(self.added)
         return "shard-00000.parquet"
+
+    def maybe_flush(self):
+        if self.flush_after is not None and len(self.added) - len(self.flushed) >= self.flush_after:
+            return self.flush()
+        return None
 
     def flush_sources(self):
         self.events.append("flush_sources")
@@ -230,9 +240,11 @@ def test_push_every_throttles_intermediate_commits(fake_segment_module, fake_hub
          "--push-to", "u/r", "--push-every", "2"])
 
     writer = fake_hub.instances[0]
-    # 6 sources at every-2 -> 3 intermediate pushes, plus the final one
-    assert writer.events.count("push_manifest") == 4
-    assert writer.events.count("flush") == 1  # shard flush only at the end here
+    # No shard ever filled, so the manifest is pushed only by the final flush.
+    assert writer.events.count("push_manifest") == 1
+    assert writer.events.count("flush") == 1
+    # Raw files still commit on the --push-every schedule.
+    assert writer.events.count("flush_sources") >= 3
 
 
 def test_every_segment_reaches_the_writer(fake_segment_module, fake_hub, tmp_path):
@@ -281,3 +293,50 @@ def test_failure_on_one_source_does_not_end_the_run(fake_segment_module, tmp_pat
     assert run(["segment", str(audio), "-o", str(out), "--no-clips"]) == 0
     records = list(manifest.read(out / "segments.jsonl"))
     assert {r["source_id"].split("/")[-1] for r in records} == {"001", "003"}
+
+
+def test_manifest_is_never_pushed_ahead_of_the_shards(fake_segment_module, fake_hub, tmp_path):
+    """The invariant resumption rests on.
+
+    ``done_sources_on_hub`` reads the uploaded manifest and skips those sources
+    for good.  If the manifest is ever uploaded while segments are still sitting
+    in the write buffer, those sources are marked done, skipped on the next run,
+    and their audio is uploaded by nobody -- rows naming audio that exists
+    nowhere.  So every manifest push must be immediately preceded by a flush.
+    """
+    audio = make_audio_tree(tmp_path / "audio", surahs=tuple(range(1, 9)))
+    out = tmp_path / "out"
+
+    fake_hub.flush_after = 6          # a shard fills every 2 sources (3 segs each)
+    try:
+        run(["segment", str(audio), "-o", str(out), "--no-clips",
+             "--push-to", "u/r", "--push-every", "1"])
+    finally:
+        fake_hub.flush_after = None
+
+    writer = fake_hub.instances[0]
+    events = writer.events
+    assert "push_manifest" in events
+    for i, event in enumerate(events):
+        if event == "push_manifest":
+            assert "flush" in events[max(0, i - 2):i], (
+                f"push_manifest at {i} without a preceding flush: {events}"
+            )
+    # And nothing is left buffered at the end.
+    assert writer.flushed == writer.added
+
+
+def test_raw_commits_do_not_drag_the_manifest_with_them(fake_segment_module, fake_hub, tmp_path):
+    """--push-every governs raw provenance files only; it must not push the
+    manifest, which is tied to shard flushes."""
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3, 4))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips",
+         "--push-to", "u/r", "--push-every", "1"])
+
+    writer = fake_hub.instances[0]
+    # 4 sources -> 4 raw commits, but no shard ever filled, so the only manifest
+    # push is the final one.
+    assert writer.events.count("flush_sources") >= 4
+    assert writer.events.count("push_manifest") == 1
