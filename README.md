@@ -65,6 +65,14 @@ from drifting off the predicted boundary and clipping a first syllable.
 The final segment of such a recording is not waqf-bounded; `stats` counts these
 separately and they should not be trusted as training examples.
 
+**dtype is auto-detected.** bfloat16 where the GPU really supports it, float16 on
+pre-Ampere cards (a Colab T4 has no bfloat16), float32 on CPU. Override with
+`--dtype`. The resolved value is written to `segment_params.json`.
+
+**On Colab, write the output somewhere that survives.** The runtime's local disk
+is wiped when the session ends. Point `-o` at a mounted Drive folder, or push to
+the Hub as soon as a pass finishes.
+
 **The thresholds are a tuning knob, not a constant.** Defaults are 200 ms silence
 floor / 400 ms speech floor / 40 ms padding — above breath noise, but low enough
 to keep short waqf units. The model card's 30/30/30 finds any speech boundary,

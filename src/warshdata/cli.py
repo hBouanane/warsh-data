@@ -54,12 +54,19 @@ def cmd_segment(args: argparse.Namespace) -> int:
     if not pending:
         return 0
 
+    segmenter = Segmenter(params)
+
+    # Record the dtype that was actually used, not the literal "auto" -- the
+    # point of this file is that a manifest can be reproduced from it.
     manifest.write_params(
         params_path,
-        {"model_id": MODEL_ID, "warsh_data_version": __version__, **asdict(params)},
+        {
+            "model_id": MODEL_ID,
+            "warsh_data_version": __version__,
+            **asdict(params),
+            "resolved_dtype": str(segmenter.dtype).replace("torch.", ""),
+        },
     )
-
-    segmenter = Segmenter(params)
 
     total, failures = 0, 0
     for n, source in enumerate(pending, start=1):
@@ -123,7 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-duration-ms", type=int, default=19995)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
+    p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto",
+                   help="auto: bfloat16 where supported, float16 on older GPUs (e.g. T4), float32 on CPU")
     p.set_defaults(func=cmd_segment)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")

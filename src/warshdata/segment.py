@@ -56,10 +56,21 @@ class SegmentParams:
     max_duration_ms: int = 19995
     batch_size: int = 8
     device: str = "cuda"
-    dtype: str = "bfloat16"
+    dtype: str = "auto"
 
     def torch_dtype(self) -> torch.dtype:
-        return _DTYPES[self.dtype]
+        """Resolve ``auto`` against the actual GPU.
+
+        The model card uses bfloat16, which pre-Ampere cards (a Colab T4, for
+        one) do not support -- asking for it there fails or falls back to
+        something painfully slow.  ``auto`` picks bfloat16 where it is real,
+        float16 on other CUDA devices, and float32 on CPU.
+        """
+        if self.dtype != "auto":
+            return _DTYPES[self.dtype]
+        if self.device == "cpu":
+            return torch.float32
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
 class Segmenter:
