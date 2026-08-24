@@ -168,6 +168,10 @@ class HubWriter:
             commit_message="Add dataset card",
         )
 
+    def repo_files(self) -> List[str]:
+        """Files currently in the repo; empty if it cannot be listed."""
+        return self._repo_files()
+
     def _repo_files(self) -> List[str]:
         try:
             return list(self.api.list_repo_files(self.repo_id, repo_type="dataset"))

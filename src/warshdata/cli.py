@@ -47,6 +47,15 @@ def cmd_segment(args: argparse.Namespace) -> int:
         # Resuming across Colab sessions: the local manifest is gone but the
         # hub one is not, so ask the hub what has already been done.
         already |= done_sources_on_hub(args.push_to)
+    if writer is not None and writer.upload_raw:
+        # A source segmented in a session that died before its batch commit
+        # is in the manifest but has no raw file. It is excluded from
+        # `pending`, so queue it here or it is never uploaded at all.
+        on_hub = set(writer.repo_files())
+        for s in sources:
+            if s.source_id in already and f"raw/{s.reciter_slug}/{s.path.name}" not in on_hub:
+                writer.queue_source(s.path, s.reciter_slug)
+
     pending = [s for s in sources if s.source_id not in already]
     if args.limit:
         pending = pending[: args.limit]
@@ -109,6 +118,16 @@ def cmd_segment(args: argparse.Namespace) -> int:
                 writer.push_manifest(manifest_path)
         flag = "" if (records and records[0].source_is_complete) else "  [incomplete: last segment is not waqf-bounded]"
         print(f"[{n}/{len(pending)}] {source.source_id}: {len(records)} segments{flag}")
+
+    if writer is not None:
+        # The last shard is almost never exactly full, and the last few
+        # sources sit below the push-every threshold -- without this they
+        # are simply never uploaded.
+        writer.flush()
+        writer.flush_sources()
+        writer.push_manifest(manifest_path)
+        print(f"Pushed {writer.rows_written} segments in {writer.shards_written} "
+              f"shard(s) to {args.push_to}")
 
     print(f"\nWrote {total} segments to {manifest_path}" + (f" ({failures} file(s) failed)" if failures else ""))
     return 0
