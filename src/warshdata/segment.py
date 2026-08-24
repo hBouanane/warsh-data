@@ -154,7 +154,7 @@ class Segmenter:
             if end <= start:
                 continue
 
-            sid = segment_id(source, start, end)
+            sid = segment_id(source, i)
             audio_path = None
             if clips_dir is not None:
                 clip_path = Path(clips_dir) / source.reciter_slug / "clips" / f"{sid}.wav"

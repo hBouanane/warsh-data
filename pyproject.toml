@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hub = ["datasets", "huggingface_hub"]
+noffmpeg = ["soxr", "scipy"]
 
 [project.scripts]
 warsh-data = "warshdata.cli:main"

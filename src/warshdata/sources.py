@@ -9,9 +9,11 @@ directory name, so the expected layout is::
       yassin-al-jazaery/
         002.mp3
 
-Segment ids are derived from the source id and the sample offsets rather than
-from a counter, so re-running with the same settings reproduces the same ids and
-a partially rebuilt manifest stays consistent with an older one.
+Segment ids are ``<reciter>__<source>__<ordinal>`` and deliberately do **not**
+encode the boundaries.  Timestamps get corrected by hand; an id built from
+start/end samples would change the moment a boundary moved, orphaning every
+label, correction, and review note attached to it.  The ordinal is stable under
+boundary edits, which is the operation that actually happens.
 """
 
 from __future__ import annotations
@@ -69,5 +71,13 @@ def discover(root: Path) -> List[Source]:
     return sources
 
 
-def segment_id(source: Source, start_sample: int, end_sample: int) -> str:
-    return f"{source.reciter_slug}__{slugify(source.path.stem)}__{start_sample}_{end_sample}"
+def segment_id(source: Source, index: int) -> str:
+    """Identity for a segment: stable under boundary correction.
+
+    Not derived from start/end samples on purpose -- see the module docstring.
+    Re-segmenting the same source with *different* thresholds does renumber
+    these; that is a new derivation of the corpus, and corrections carry the
+    boundaries they were written against so they can be re-matched by overlap
+    rather than silently applied to the wrong audio.
+    """
+    return f"{source.reciter_slug}__{slugify(source.path.stem)}__{index:04d}"

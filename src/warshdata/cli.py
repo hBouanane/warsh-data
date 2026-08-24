@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import Counter
 from dataclasses import asdict
@@ -29,7 +30,23 @@ def cmd_segment(args: argparse.Namespace) -> int:
         print(f"No audio found under {args.input}", file=sys.stderr)
         return 1
 
+    writer = None
+    if args.push_to:
+        from .hub import HubWriter, done_sources_on_hub
+
+        writer = HubWriter(
+            repo_id=args.push_to,
+            work_dir=out_dir / "_shards",
+            shard_bytes=int(args.shard_mb * 1024 * 1024),
+            private=args.private,
+            upload_raw=not args.no_raw,
+        )
+
     already = manifest.done_sources(manifest_path) if args.resume else set()
+    if writer is not None and args.resume:
+        # Resuming across Colab sessions: the local manifest is gone but the
+        # hub one is not, so ask the hub what has already been done.
+        already |= done_sources_on_hub(args.push_to)
     pending = [s for s in sources if s.source_id not in already]
     if args.limit:
         pending = pending[: args.limit]
@@ -80,6 +97,16 @@ def cmd_segment(args: argparse.Namespace) -> int:
         # Written per source, so an interrupted run resumes at file granularity.
         manifest.append(manifest_path, records)
         total += len(records)
+
+        if writer is not None:
+            for rec in records:
+                writer.add(asdict(rec), _wave[rec.start_sample : rec.end_sample].numpy())
+            writer.queue_source(source.path, source.reciter_slug)
+            # Throttled: one manifest commit per source would be thousands of
+            # commits over a full pass.
+            if n % args.push_every == 0:
+                writer.flush_sources()
+                writer.push_manifest(manifest_path)
         flag = "" if (records and records[0].source_is_complete) else "  [incomplete: last segment is not waqf-bounded]"
         print(f"[{n}/{len(pending)}] {source.source_id}: {len(records)} segments{flag}")
 
@@ -164,6 +191,38 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_apply_corrections(args: argparse.Namespace) -> int:
+    from .corrections import apply, read_corrections
+
+    records = list(manifest.read(Path(args.manifest)))
+    if not records:
+        print("Manifest is empty or missing.", file=sys.stderr)
+        return 1
+
+    corrections = read_corrections(Path(args.corrections))
+    if not corrections:
+        print(f"No corrections found in {args.corrections}", file=sys.stderr)
+        return 1
+
+    final, report = apply(records, corrections, strict_drift=args.strict_drift)
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as fh:
+        for rec in final:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"{len(records)} in -> {len(final)} out")
+    print(f"  applied {report.applied}, dropped {report.dropped}, split into {report.split_into}")
+    for label, items in (("drifted", report.drifted), ("unmatched", report.unmatched), ("invalid", report.invalid)):
+        if items:
+            print(f"  {label}: {len(items)}")
+            for item in items[:10]:
+                print(f"    {item}")
+    print(f"Wrote {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -181,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pad-duration-ms", type=int, default=40)
     p.add_argument("--max-duration-ms", type=int, default=19995)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--push-to", metavar="REPO_ID", help="stream shards to this HF dataset repo as they fill")
+    p.add_argument("--shard-mb", type=int, default=400, help="audio MB per parquet shard (default: 400)")
+    p.add_argument("--private", action="store_true", help="create the HF dataset repo private")
+    p.add_argument("--no-raw", action="store_true", help="do not upload the source mp3s")
+    p.add_argument("--push-every", type=int, default=10,
+                   help="commit the manifest and queued sources every N recordings (default: 10)")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto",
                    help="auto: bfloat16 where supported, float16 on older GPUs (e.g. T4), float32 on CPU")
@@ -201,6 +266,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")
     p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("apply-corrections", help="apply hand corrections to a manifest")
+    p.add_argument("manifest", help="path to segments.jsonl")
+    p.add_argument("corrections", help="path to corrections.jsonl")
+    p.add_argument("-o", "--output", default="./out/segments.final.jsonl")
+    p.add_argument("--strict-drift", action="store_true",
+                   help="skip corrections whose recorded boundaries no longer match")
+    p.set_defaults(func=cmd_apply_corrections)
 
     return parser
 

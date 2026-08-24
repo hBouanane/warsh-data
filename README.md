@@ -82,6 +82,58 @@ Outputs:
 - `out/segment_params.json` — the settings the manifest was produced with
 - `out/segments/<reciter>/clips/<segment_id>.wav` — 16 kHz mono clips
 
+## Push to the Hub
+
+```bash
+warsh-data segment ./audio -o ./out --push-to <user>/warsh-segments-v2 --resume
+```
+
+Segments stream into parquet shards and upload as each fills, so local disk never
+grows past one shard and a dead session loses at most the shard in flight.
+`--resume` reads the *manifest* from the Hub -- a few MB, not the corpus -- so a
+run continues across sessions.
+
+Repo layout:
+
+| path | what | read during training |
+|---|---|---|
+| `data/shard-*.parquet` | rows + audio embedded as 16 kHz mono FLAC | yes, streamed |
+| `manifests/segments.jsonl` | same rows, no audio | no |
+| `raw/<reciter>/NNN.mp3` | source recordings | no |
+
+```python
+from datasets import load_dataset
+ds = load_dataset("<user>/warsh-segments-v2", split="train", streaming=True)
+```
+
+Embedded audio in sharded parquet, rather than one file per clip: hundreds of
+thousands of small LFS objects are slow to list, slow to fetch, and awkward to
+shuffle. Streaming pulls only the shards being iterated.
+
+## Correcting segments by hand
+
+Reviewing by ear always turns up boundaries to nudge, junk to drop, and clips
+that should have been two. Do **not** edit `segments.jsonl` -- the next
+segmentation run regenerates it. Write a `corrections.jsonl` instead:
+
+```json
+{"segment_id": "ibrahim-aldosari__087__0003", "action": "adjust", "start_seconds": 12.4, "orig_start_seconds": 12.0, "note": "clipped alif"}
+{"segment_id": "ibrahim-aldosari__087__0007", "action": "drop", "note": "station ident"}
+{"segment_id": "ibrahim-aldosari__087__0011", "action": "split", "at_seconds": [31.8], "note": "two ayahs"}
+```
+
+```bash
+warsh-data apply-corrections ./out/segments.jsonl ./out/corrections.jsonl -o ./out/segments.final.jsonl
+```
+
+Segment ids are `<reciter>__<surah>__<ordinal>` and deliberately **do not encode
+timestamps**, so moving a boundary does not change the id and does not orphan the
+label, note, or review attached to it.
+
+`orig_*_seconds` records what the reviewer actually listened to. If segmentation
+is later re-run with different thresholds and a segment has moved, the correction
+is reported as *drifted* rather than applied blind to audio nobody reviewed.
+
 ## Notes
 
 **Resume is real.** Records are appended and flushed after each source file, so an
