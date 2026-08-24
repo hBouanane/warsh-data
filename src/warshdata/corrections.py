@@ -16,7 +16,12 @@ Actions:
 
 ``adjust``  new ``start_seconds`` / ``end_seconds`` (either may be omitted)
 ``drop``    exclude from the final manifest, with the reason retained
-``split``   cut into children at ``at_seconds``, ids suffixed ``_a``, ``_b``, ...
+``split``   a waqf the model missed: cut at ``at_seconds``, children suffixed
+            ``_a``, ``_b``, ...
+``merge``   the mirror case -- a boundary the model invented at a breath pause:
+            absorb the segments in ``with`` into this one.  The surviving record
+            keeps *this* segment's id, so whatever was already attached to it
+            stays attached.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 __all__ = ["Correction", "read_corrections", "apply", "ApplyReport"]
 
-_ACTIONS = {"adjust", "drop", "split"}
+_ACTIONS = {"adjust", "drop", "split", "merge"}
 
 
 @dataclass
@@ -38,6 +43,8 @@ class Correction:
     start_seconds: Optional[float] = None
     end_seconds: Optional[float] = None
     at_seconds: List[float] = field(default_factory=list)
+    #: For ``merge``: ids absorbed into this segment.
+    with_ids: List[str] = field(default_factory=list)
     note: str = ""
     #: Boundaries the reviewer actually listened to, used to detect drift.
     orig_start_seconds: Optional[float] = None
@@ -49,6 +56,7 @@ class ApplyReport:
     applied: int = 0
     dropped: int = 0
     split_into: int = 0
+    merged_away: int = 0
     unmatched: List[str] = field(default_factory=list)
     drifted: List[str] = field(default_factory=list)
     invalid: List[str] = field(default_factory=list)
@@ -71,11 +79,22 @@ def read_corrections(path: Path) -> List[Correction]:
                     start_seconds=raw.get("start_seconds"),
                     end_seconds=raw.get("end_seconds"),
                     at_seconds=list(raw.get("at_seconds", [])),
+                    with_ids=list(raw.get("with", raw.get("with_ids", []))),
                     note=raw.get("note", ""),
                     orig_start_seconds=raw.get("orig_start_seconds"),
                     orig_end_seconds=raw.get("orig_end_seconds"),
                 )
             )
+    return out
+
+
+def _suffix(n: int) -> str:
+    """a, b, ... z, aa, ab, ...  -- ``chr(ord('a') + n)`` breaks past 26."""
+    out = ""
+    n += 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("a") + rem) + out
     return out
 
 
@@ -116,7 +135,22 @@ def apply(
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
+    # Merges span several records, so the manifest has to be materialised and
+    # indexed before anything is emitted.
+    records = list(records)
+    rec_by_id = {r.get("segment_id"): r for r in records}
+    absorbed: Dict[str, str] = {}
+    for c in by_id.values():
+        if c.action != "merge":
+            continue
+        for other in c.with_ids:
+            absorbed[other] = c.segment_id
+
     for rec in records:
+        if rec.get("segment_id") in absorbed:
+            # Emitted as part of the segment that absorbed it.
+            report.merged_away += 1
+            continue
         sid = rec.get("segment_id")
         c = by_id.get(sid)
         if c is None:
@@ -137,6 +171,31 @@ def apply(
 
         if c.action == "drop":
             report.dropped += 1
+            continue
+
+        if c.action == "merge":
+            parts = [rec] + [rec_by_id[i] for i in c.with_ids if i in rec_by_id]
+            missing = [i for i in c.with_ids if i not in rec_by_id]
+            if missing:
+                report.invalid.append(f"{sid}: merge target(s) not in manifest: {', '.join(missing)}")
+            foreign = {p["source_id"] for p in parts} - {rec["source_id"]}
+            if foreign:
+                report.invalid.append(f"{sid}: refusing to merge across sources {sorted(foreign)}")
+                out.append(rec)
+                continue
+            new = _retime(
+                rec,
+                min(p["start_seconds"] for p in parts),
+                max(p["end_seconds"] for p in parts),
+            )
+            new["corrected"] = True
+            new["correction_note"] = c.note
+            new["merged_from"] = [p["segment_id"] for p in parts]
+            # Spans audio the old clip never covered, so it must be re-cut.
+            new["audio_path"] = None
+            new["is_last_of_source"] = any(p.get("is_last_of_source") for p in parts)
+            out.append(new)
+            report.applied += 1
             continue
 
         if c.action == "adjust":
@@ -162,7 +221,7 @@ def apply(
         edges = [rec["start_seconds"], *cuts, rec["end_seconds"]]
         for n, (a, b) in enumerate(zip(edges, edges[1:])):
             child = _retime(rec, a, b)
-            child["segment_id"] = f"{sid}_{chr(ord('a') + n)}"
+            child["segment_id"] = f"{sid}_{_suffix(n)}"
             child["parent_segment_id"] = sid
             child["corrected"] = True
             child["correction_note"] = c.note
@@ -172,5 +231,5 @@ def apply(
         report.split_into += len(edges) - 1
         report.applied += 1
 
-    report.unmatched = sorted(set(by_id) - seen)
+    report.unmatched = sorted(set(by_id) - seen - set(absorbed))
     return out, report

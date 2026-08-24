@@ -213,7 +213,8 @@ def cmd_apply_corrections(args: argparse.Namespace) -> int:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     print(f"{len(records)} in -> {len(final)} out")
-    print(f"  applied {report.applied}, dropped {report.dropped}, split into {report.split_into}")
+    print(f"  applied {report.applied}, dropped {report.dropped}, "
+          f"split into {report.split_into}, merged away {report.merged_away}")
     for label, items in (("drifted", report.drifted), ("unmatched", report.unmatched), ("invalid", report.invalid)):
         if items:
             print(f"  {label}: {len(items)}")

@@ -119,8 +119,18 @@ segmentation run regenerates it. Write a `corrections.jsonl` instead:
 ```json
 {"segment_id": "ibrahim-aldosari__087__0003", "action": "adjust", "start_seconds": 12.4, "orig_start_seconds": 12.0, "note": "clipped alif"}
 {"segment_id": "ibrahim-aldosari__087__0007", "action": "drop", "note": "station ident"}
-{"segment_id": "ibrahim-aldosari__087__0011", "action": "split", "at_seconds": [31.8], "note": "two ayahs"}
+{"segment_id": "ibrahim-aldosari__087__0011", "action": "split", "at_seconds": [31.8], "note": "waqf the model missed"}
+{"segment_id": "ibrahim-aldosari__087__0014", "action": "merge", "with": ["ibrahim-aldosari__087__0015"], "note": "breath pause, not a waqf"}
 ```
+
+`split` and `merge` are the two halves of a boundary error. A missed waqf splits
+one segment into `__0011_a` / `__0011_b`, both recording `parent_segment_id`. An
+invented boundary -- the model cutting at a breath pause mid-ayah -- merges the
+extra segments into the first, which **keeps its own id**, so anything already
+attached to it stays attached. Both clear `audio_path`, since the clip on disk no
+longer matches the new boundaries and has to be re-cut.
+
+Merging across different source recordings is refused rather than guessed at.
 
 ```bash
 warsh-data apply-corrections ./out/segments.jsonl ./out/corrections.jsonl -o ./out/segments.final.jsonl
