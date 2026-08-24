@@ -87,6 +87,58 @@ def cmd_segment(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    from .fetch import download_surah, list_moshafs, surah_url
+
+    try:
+        moshafs = list_moshafs(args.rewaya, include_variant_tariq=args.include_variant_tariq)
+    except Exception as exc:
+        print(f"Could not reach the mp3quran API: {exc}", file=sys.stderr)
+        return 1
+
+    if args.reciter:
+        wanted = {r.lower() for r in args.reciter}
+        moshafs = [m for m in moshafs if m.slug.lower() in wanted]
+        if not moshafs:
+            print("No reciter matched. Run --list to see the available slugs.", file=sys.stderr)
+            return 1
+
+    if args.list:
+        print(f"{len(moshafs)} moshaf(s) matching rewaya={args.rewaya!r}:\n")
+        for m in moshafs:
+            flag = "  [variant tariq]" if m.variant_tariq else ""
+            print(f"  {m.slug:<32} {m.n_surahs:>3} surahs  {m.moshaf_name}{flag}")
+            print(f"  {'':<32} {m.server}")
+        return 0
+
+    out_dir = Path(args.output)
+    jobs = []
+    for m in moshafs:
+        surahs = [s for s in m.surahs if not args.surah or s in set(args.surah)]
+        jobs.extend((m, s) for s in surahs)
+
+    if args.dry_run:
+        for m, s in jobs:
+            print(f"  {m.slug}/{s:03d}.mp3  <-  {surah_url(m, s)}")
+        print(f"\n{len(jobs)} file(s) would be downloaded to {out_dir}")
+        return 0
+
+    print(f"Downloading {len(jobs)} file(s) from {len(moshafs)} reciter(s) to {out_dir}")
+    counts = Counter()
+    for n, (m, s) in enumerate(jobs, start=1):
+        res = download_surah(m, s, out_dir, retries=args.retries)
+        counts[res["status"]] += 1
+        if res["status"] == "failed":
+            print(f"[{n}/{len(jobs)}] FAILED {m.slug}/{s:03d}.mp3: {res['error']}", file=sys.stderr)
+        elif res["status"] == "downloaded":
+            print(f"[{n}/{len(jobs)}] {m.slug}/{s:03d}.mp3  {res['bytes'] / 1e6:.1f} MB")
+        elif n % 25 == 0 or n == len(jobs):
+            print(f"[{n}/{len(jobs)}] ...")
+
+    print(f"\nDownloaded {counts['downloaded']}, skipped {counts['skipped']}, failed {counts['failed']}")
+    return 1 if counts["failed"] and not counts["downloaded"] else 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     records = list(manifest.read(Path(args.manifest)))
     if not records:
@@ -133,6 +185,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto",
                    help="auto: bfloat16 where supported, float16 on older GPUs (e.g. T4), float32 on CPU")
     p.set_defaults(func=cmd_segment)
+
+    p = sub.add_parser("fetch", help="download recitations from mp3quran.net")
+    p.add_argument("-o", "--output", default="./audio", help="output directory (default: ./audio)")
+    p.add_argument("--rewaya", default="warsh", help="substring matched against the moshaf name (default: warsh)")
+    p.add_argument("--reciter", action="append", help="restrict to this reciter slug; repeatable")
+    p.add_argument("--surah", type=int, action="append", help="restrict to this surah number; repeatable")
+    p.add_argument("--list", action="store_true", help="list matching reciters and exit")
+    p.add_argument("--dry-run", action="store_true", help="list the files that would be downloaded and exit")
+    p.add_argument("--retries", type=int, default=3)
+    p.add_argument("--include-variant-tariq", action="store_true",
+                   help="also fetch Warsh via Tariq al-Asbahani, whose pronunciation differs")
+    p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")

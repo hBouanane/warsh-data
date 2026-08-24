@@ -24,6 +24,38 @@ conda create -n warsh python=3.12 && conda activate warsh && conda install -c co
 pip install -e .
 ```
 
+## Fetch
+
+Warsh recitations come from the [mp3quran.net](https://mp3quran.net) API
+(`/api/v3/reciters`), which lists a `server` base URL per reciter; files are
+`{server}{surah:03d}.mp3`. Paths are discovered, not hardcoded, so a reciter
+added upstream is picked up for free.
+
+```bash
+warsh-data fetch --list
+```
+
+```bash
+warsh-data fetch -o ./audio
+```
+
+15 Warsh reciters, ~1495 surah files, several GB. Downloads land in the
+`audio/<reciter-slug>/NNN.mp3` layout `segment` expects. Files are written to
+`.part` and renamed only when complete, so a re-run resumes safely and can never
+mistake a truncated mp3 for a finished one.
+
+One surah, one reciter -- the sane first run, and what fits a Colab session:
+
+```bash
+warsh-data fetch --reciter ibrahim-aldosary --surah 1 -o ./audio
+```
+
+**Tariq.** Warsh via Tariq Abi Baker al-Asbahani pronounces differently from the
+standard Tariq al-Azraq. It is excluded by default and slugged
+`--variant-tariq` when `--include-variant-tariq` is passed, so it cannot end up
+in a training pool unnoticed. Reciters whose moshaf name spells out *Tariq
+al-Azraq* are standard Warsh and are included normally.
+
 ## Layout
 
 The reciter slug is taken from the parent directory:
