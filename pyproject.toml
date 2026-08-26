@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hub = ["datasets", "huggingface_hub"]
+align = ["rapidfuzz", "numpy"]  # plus warsh-lab: pip install -e ../warsh-lab
 noffmpeg = ["soxr", "scipy"]
 dev = ["pytest", "datasets", "huggingface_hub", "pyarrow", "soundfile", "numpy"]
 
