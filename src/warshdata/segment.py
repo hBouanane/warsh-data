@@ -63,7 +63,7 @@ class SegmentParams:
     hand-checked sample before a full run.
     """
 
-    min_silence_duration_ms: int = 200
+    min_silence_duration_ms: int = 90
     min_speech_duration_ms: int = 400
     pad_duration_ms: int = 40
     max_duration_ms: int = 19995
