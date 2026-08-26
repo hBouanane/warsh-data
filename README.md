@@ -110,6 +110,33 @@ resampled to 16 kHz mono anyway.
 warsh-data audit ./audio --write-ids suspect.txt
 ```
 
+## Listening to what was flagged
+
+A flag is a question, not an answer. `audit` says `rachid-belalya/094` is wrong;
+only listening says *how*.
+
+```bash
+warsh-data listen ./audio -o ./listen
+```
+
+With no `--ids` it audits first and excerpts whatever it flagged, so this alone
+is a complete workflow. Open `listen/index.html`.
+
+Three 15-second excerpts per recording, taken from the **start, middle and end**
+rather than the first 15 seconds: a file that is the wrong recitation entirely
+usually sounds fine at the opening (basmala), and only the middle gives it away.
+
+The page is one self-contained file -- audio embedded as data URIs, no server, no
+external requests, nothing to break when it is downloaded off Colab. The
+individual clips are also left in `listen/clips/`.
+
+```bash
+warsh-data listen ./audio --ids suspect.txt -o ./listen --clips 5 --seconds 20
+```
+
+Excerpts are mp3 where ffmpeg is available and WAV otherwise (about ten times
+larger, which only matters for the embedded page).
+
 ## Checking the thresholds before a full pass
 
 Reciters differ enormously in pace, and one silence floor does not fit all of

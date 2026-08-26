@@ -346,6 +346,76 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_listen(args: argparse.Namespace) -> int:
+    """Cut short excerpts from suspect recordings into one playable page."""
+    from .audit import find_outliers, probe_all
+    from .preview import build_page, extract_excerpts
+
+    sources = {s.source_id: s for s in discover(Path(args.input))}
+    if not sources:
+        print(f"No audio found under {args.input}", file=sys.stderr)
+        return 1
+
+    notes = {}
+    if args.ids:
+        wanted = [
+            line.strip()
+            for line in Path(args.ids).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    else:
+        # No list given: audit first, so `listen` alone is a complete workflow.
+        print(f"Auditing {len(sources)} file(s) ...")
+        findings = find_outliers(probe_all(list(sources.values()), workers=args.workers),
+                                 factor=args.factor)
+        wanted = []
+        for finding in findings:
+            if finding.source_id not in notes:
+                wanted.append(finding.source_id)
+            notes[finding.source_id] = f"{finding.kind}: {finding.detail}"
+        if not wanted:
+            print("Nothing suspicious to listen to.")
+            return 0
+
+    missing = [sid for sid in wanted if sid not in sources]
+    for sid in missing:
+        print(f"warning: {sid} not found under {args.input}", file=sys.stderr)
+    wanted = [sid for sid in wanted if sid in sources]
+    if not wanted:
+        print("No matching recordings.", file=sys.stderr)
+        return 1
+
+    probes = {p.source_id: p for p in probe_all([sources[sid] for sid in wanted])}
+
+    out_dir = Path(args.output)
+    groups = []
+    for sid in wanted:
+        probe = probes.get(sid)
+        if probe is None or not probe.duration_seconds:
+            print(f"warning: {sid} has no readable duration, skipping", file=sys.stderr)
+            continue
+        excerpts = extract_excerpts(
+            sid, sources[sid].path, probe.duration_seconds,
+            out_dir / "clips", count=args.clips, clip_seconds=args.seconds,
+        )
+        if not excerpts:
+            print(f"warning: could not extract excerpts from {sid}", file=sys.stderr)
+            continue
+        groups.append((sid, notes.get(sid, "flagged for review"),
+                       probe.duration_seconds, excerpts))
+        print(f"  {sid}: {len(excerpts)} excerpt(s)")
+
+    if not groups:
+        print("Nothing to play.", file=sys.stderr)
+        return 1
+
+    page = build_page(groups, out_dir / "index.html")
+    print("")
+    print(f"Wrote {page}")
+    print(f"Clips also in {out_dir / 'clips'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -395,6 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", metavar="PATH", help="write findings as JSON")
     p.add_argument("--write-ids", metavar="PATH", help="write suspect source ids, one per line")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("listen", help="excerpt suspect recordings into a playable page")
+    p.add_argument("input", help="audio directory laid out as <root>/<reciter-slug>/<file>")
+    p.add_argument("-o", "--output", default="./listen", help="output directory")
+    p.add_argument("--ids", metavar="PATH",
+                   help="file of source ids to excerpt; without it, audit and use its findings")
+    p.add_argument("--clips", type=int, default=3, help="excerpts per recording (default: 3)")
+    p.add_argument("--seconds", type=float, default=15.0, help="excerpt length (default: 15)")
+    p.add_argument("--factor", type=float, default=3.0)
+    p.add_argument("--workers", type=int, default=8)
+    p.set_defaults(func=cmd_listen)
 
     p = sub.add_parser("manifest", help="build a manifest from a published repo")
     p.add_argument("repo", help="HF dataset repo id")
