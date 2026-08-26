@@ -81,8 +81,24 @@ class AlignConfig:
     anchor_n: int = 4
     #: Maximum normalised distance for an anchor n-gram to count as matched.
     anchor_max_distance: float = 0.25
-    #: Don't bother anchoring inside gaps already smaller than this.
-    min_gap_to_split: int = 40
+    #: Word anchors are only added inside gaps at least this wide.  Swept
+    #: empirically: at 40 they fire on text that already has plenty of n-gram
+    #: anchors and cost accuracy there; at 120 they reach the refrain-heavy
+    #: surahs that need them (+4.2 pts on Ar-Rahman) for 0.4 of a point
+    #: elsewhere.
+    min_gap_to_split: int = 120
+    #: Also anchor on single words that occur exactly once in the surah.  Exact
+    #: n-gram anchors vanish once the error rate is high enough that no four
+    #: consecutive words survive intact; one distinctive long word often does.
+    word_anchors: bool = True
+    #: Shortest word eligible to be a word anchor.  Short words are common and
+    #: easily confused, so they carry little evidence.
+    word_anchor_min_len: int = 5
+    #: Maximum distance for a word anchor to count as matched.
+    word_anchor_max_distance: float = 0.34
+    #: A word anchor is only trusted when the runner-up is this much worse,
+    #: which is what stops a refrain word from anchoring to the wrong copy.
+    word_anchor_margin: float = 0.15
     #: A segment whose transcript is this far from its aligned reference text is
     #: reported as failed rather than trusted.
     max_segment_distance: float = 0.5
@@ -90,6 +106,9 @@ class AlignConfig:
     formula_max_distance: float = 0.35
     #: Strip isti'adha / basmala from the opening and sadaqallah from the close.
     strip_opening: bool = True
+    #: How similar two adjacent transcripts must be to count as one passage
+    #: recited twice rather than two different passages that happen to adjoin.
+    repeat_max_distance: float = 0.35
 
 
 @dataclass
@@ -192,8 +211,81 @@ def _ngram_positions(words: Sequence[str], n: int) -> Dict[Tuple[str, ...], List
     return positions
 
 
+def _word_anchor_candidates(ref: Sequence[str], hyp: Sequence[str],
+                            config: AlignConfig) -> List[Tuple[int, int]]:
+    """Anchors from single words unique in the surah.
+
+    Survives error rates that destroy every exact n-gram.  Two guards keep them
+    honest: the word must be unique in the reference, and its best match in the
+    hypothesis must beat the runner-up by a margin -- otherwise a word from a
+    repeated refrain could pin the alignment to the wrong copy.
+    """
+    from rapidfuzz.distance import Levenshtein
+    from rapidfuzz.process import cdist
+
+    counts = Counter(ref)
+    rare = [
+        (index, word) for index, word in enumerate(ref)
+        if counts[word] == 1 and len(word) >= config.word_anchor_min_len
+    ]
+    if not rare or not hyp:
+        return []
+
+    import numpy as np
+
+    matrix = cdist([word for _, word in rare], list(hyp),
+                   scorer=Levenshtein.normalized_distance, workers=-1)
+
+    out: List[Tuple[int, int]] = []
+    for row, (ref_index, _) in enumerate(rare):
+        distances = matrix[row]
+        best = int(np.argmin(distances))
+        if distances[best] > config.word_anchor_max_distance:
+            continue
+        if len(distances) > 1:
+            runner_up = float(np.partition(distances, 1)[1])
+            if runner_up - float(distances[best]) < config.word_anchor_margin:
+                continue
+        out.append((ref_index, best, 1))
+    return out
+
+
+def _lis_chain(candidates: Sequence[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    """Largest subset that increases in both sequences.
+
+    Must be a real longest-increasing-subsequence, not a greedy sweep: greedily
+    keeping the first candidate that still increases lets one bad early anchor
+    with a large hypothesis index block every good anchor after it.
+    """
+    if not candidates:
+        return []
+
+    ordered = sorted(candidates)
+    tails: List[int] = []
+    index_of: List[int] = []
+    prev: List[int] = []
+
+    for position, (_, hyp_index, _length) in enumerate(ordered):
+        slot = bisect_left(tails, hyp_index)
+        if slot == len(tails):
+            tails.append(hyp_index)
+            index_of.append(position)
+        else:
+            tails[slot] = hyp_index
+            index_of[slot] = position
+        prev.append(index_of[slot - 1] if slot else -1)
+
+    chain: List[Tuple[int, int, int]] = []
+    cursor = index_of[-1] if index_of else -1
+    while cursor >= 0:
+        chain.append(ordered[cursor])
+        cursor = prev[cursor]
+    chain.reverse()
+    return chain
+
+
 def _find_anchors(ref: Sequence[str], hyp: Sequence[str], config: AlignConfig
-                  ) -> List[Tuple[int, int]]:
+                  ) -> List[Tuple[int, int, int]]:
     """Pairs ``(ref_index, hyp_index)`` that pin the alignment.
 
     Only n-grams unique on *both* sides qualify, so a repeated refrain can never
@@ -206,41 +298,51 @@ def _find_anchors(ref: Sequence[str], hyp: Sequence[str], config: AlignConfig
     ref_positions = _ngram_positions(ref, n)
     hyp_positions = _ngram_positions(hyp, n)
 
-    candidates: List[Tuple[int, int]] = []
+    candidates: List[Tuple[int, int, int]] = []
     for gram, refs in ref_positions.items():
         if len(refs) != 1:
             continue
         hyps = hyp_positions.get(gram)
         if hyps and len(hyps) == 1:
-            candidates.append((refs[0], hyps[0]))
+            candidates.append((refs[0], hyps[0], n))
 
-    if not candidates:
+    if not candidates and not config.word_anchors:
         return []
 
-    # Keep the largest monotonically increasing subset: any anchor that would
-    # require going backwards is inconsistent with a reciter reading in order,
-    # so it is dropped rather than trusted.
-    candidates.sort()
-    tails: List[int] = []
-    prev: List[int] = []
-    index_of: List[int] = []
-    for position, (_, hyp_index) in enumerate(candidates):
-        slot = bisect_left(tails, hyp_index)
-        if slot == len(tails):
-            tails.append(hyp_index)
-            index_of.append(position)
-        else:
-            tails[slot] = hyp_index
-            index_of[slot] = position
-        prev.append(index_of[slot - 1] if slot else -1)
+    # Deduplicate by reference position, preferring the earliest hypothesis hit,
+    # so an n-gram anchor and a word anchor cannot contradict each other.
+    # An n-gram anchor beats a word anchor at the same position: it rests on
+    # more evidence.
+    best_by_ref: Dict[int, Tuple[int, int]] = {}
+    for ref_index, hyp_index, length in candidates:
+        current = best_by_ref.get(ref_index)
+        if current is None or length > current[1]:
+            best_by_ref[ref_index] = (hyp_index, length)
 
-    chain: List[Tuple[int, int]] = []
-    cursor = index_of[-1] if index_of else -1
-    while cursor >= 0:
-        chain.append(candidates[cursor])
-        cursor = prev[cursor]
-    chain.reverse()
-    return chain
+    chain = _lis_chain([(r, h, l) for r, (h, l) in best_by_ref.items()])
+
+    if not config.word_anchors:
+        return chain
+
+    # Word anchors are added only where n-gram anchors left a large gap.  Applied
+    # everywhere they are net harmful: in text with plenty of unique phrasing
+    # they add weak evidence beside strong, and the weak evidence wins ties it
+    # should lose.  Confined to the gaps, they only ever replace nothing.
+    filler: List[Tuple[int, int, int]] = []
+    bounds = [(0, 0)] + [(r + l, h + l) for r, h, l in chain] + [(len(ref), len(hyp))]
+    for (ref_from, hyp_from), (ref_to, hyp_to) in zip(bounds, bounds[1:]):
+        if ref_to - ref_from <= config.min_gap_to_split:
+            continue
+        if hyp_to - hyp_from <= 0:
+            continue
+        found = _word_anchor_candidates(
+            ref[ref_from:ref_to], hyp[hyp_from:hyp_to], config)
+        filler.extend((ref_from + r, hyp_from + h, l) for r, h, l in found)
+
+    if not filler:
+        return chain
+
+    return _lis_chain(chain + filler)
 
 
 def strip_formulas(
@@ -294,7 +396,7 @@ def align_words(ref: Sequence[str], hyp: Sequence[str],
     mapping: List[Optional[int]] = [None] * len(hyp)
     ref_cursor = hyp_cursor = 0
 
-    for ref_index, hyp_index in anchors + [(len(ref), len(hyp))]:
+    for ref_index, hyp_index, length in anchors + [(len(ref), len(hyp), 0)]:
         if ref_index < ref_cursor or hyp_index < hyp_cursor:
             continue  # already covered by a previous anchor's span
         gap = _dp_align(ref[ref_cursor:ref_index], hyp[hyp_cursor:hyp_index])
@@ -303,11 +405,13 @@ def align_words(ref: Sequence[str], hyp: Sequence[str],
                 mapping[hyp_cursor + offset] = ref_cursor + target
 
         if ref_index < len(ref):
-            for k in range(config.anchor_n):
+            # Advance by the anchor's own length: a one-word anchor consumes one
+            # word, not the n-gram width.
+            for k in range(length):
                 if hyp_index + k < len(hyp) and ref_index + k < len(ref):
                     mapping[hyp_index + k] = ref_index + k
-            ref_cursor = ref_index + config.anchor_n
-            hyp_cursor = hyp_index + config.anchor_n
+            ref_cursor = ref_index + length
+            hyp_cursor = hyp_index + length
 
     return mapping, len(anchors)
 
@@ -401,6 +505,46 @@ def align_surah(
             ok=distance <= config.max_segment_distance,
             hypothesis=transcript,
         ))
+
+    # A repeat does not always leave one segment empty: the DP will happily give
+    # each copy half of the span, which looks aligned and is wrong.  Two adjacent
+    # segments whose spans are contiguous *and* whose transcripts are near
+    # duplicates of each other are one passage recited twice, so both get the
+    # union rather than a half each.
+    for position in range(len(results) - 1):
+        first, second = results[position], results[position + 1]
+        if first.ref_start < 0 or second.ref_start < 0:
+            continue
+        if first.formula or second.formula or first.ref_end != second.ref_start:
+            continue
+        left = " ".join(normalizer(first.hypothesis))
+        right = " ".join(normalizer(second.hypothesis))
+        if not left or not right:
+            continue
+        if _distance(left, right) > config.repeat_max_distance:
+            continue
+
+        start, end = first.ref_start, second.ref_end
+        span_rasm = surah.rasm(start, end)
+
+        # Resembling each other is not enough.  In a surah built on a refrain,
+        # two *different* consecutive passages both containing it look alike and
+        # sit side by side -- merging those spans loses a whole verse.  A real
+        # repeat is two recitations of the same passage, so each transcript must
+        # match the whole union, not half of it.
+        if (_distance(left, span_rasm) > config.repeat_max_distance
+                or _distance(right, span_rasm) > config.repeat_max_distance):
+            continue
+
+        span_label = surah.label(start, end)
+        verses = surah.verses_spanned(start, end)
+        for index, hypothesis in ((position, left), (position + 1, right)):
+            results[index] = Aligned(
+                index=results[index].index, ref_start=start, ref_end=end,
+                label=span_label, rasm=span_rasm, verses=list(verses),
+                distance=_distance(hypothesis, span_rasm), ok=True,
+                hypothesis=results[index].hypothesis, repeat=True,
+            )
 
     # A reciter who stops and repeats produces two segments of the same audio.
     # Monotonic alignment can only give the reference span to one of them, so the
