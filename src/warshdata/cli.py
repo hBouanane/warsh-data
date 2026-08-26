@@ -295,6 +295,57 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Flag source recordings that look wrong before any GPU time is spent."""
+    from .audit import bitrate_table, find_outliers, probe_all, summary
+
+    sources = discover(Path(args.input))
+    if not sources:
+        print(f"No audio found under {args.input}", file=sys.stderr)
+        return 1
+
+    print(f"Probing {len(sources)} file(s) ...")
+    probes = probe_all(sources, workers=args.workers)
+    info = summary(probes)
+    print(f"{info['files']} files, {info['readable']} readable, "
+          f"{info['hours']} h, {info['gigabytes']} GB")
+
+    if args.bitrates:
+        print("")
+        print(f"{'reciter':<30} {'kbps':>8} {'files':>6}")
+        print("-" * 46)
+        for slug, bps, count in bitrate_table(probes):
+            print(f"{slug:<30} {bps * 8 / 1000:>8.0f} {count:>6}")
+
+    findings = find_outliers(probes, factor=args.factor)
+    print("")
+    if not findings:
+        print("Nothing suspicious.")
+        return 0
+
+    print(f"{len(findings)} suspect file(s):")
+    print("")
+    for finding in findings:
+        print("  " + finding.line())
+
+    print("")
+    print("A 'too long' or 'too short' file is compared against the median for the")
+    print("same surah across reciters, so it means this recording disagrees with the")
+    print("others -- listen before trusting it.")
+
+    if args.json:
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps([f.__dict__ for f in findings], indent=2), encoding="utf-8")
+        print(f"Wrote {out}")
+    if args.write_ids:
+        out = Path(args.write_ids)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(chr(10).join(f.source_id for f in findings) + chr(10), encoding="utf-8")
+        print(f"Wrote {len(findings)} source id(s) to {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -334,6 +385,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-variant-tariq", action="store_true",
                    help="also fetch Warsh via Tariq al-Asbahani, whose pronunciation differs")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("audit", help="flag suspect source recordings before segmenting")
+    p.add_argument("input", help="audio directory laid out as <root>/<reciter-slug>/<file>")
+    p.add_argument("--factor", type=float, default=3.0,
+                   help="how far off the per-surah median counts as suspect (default: 3x)")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--bitrates", action="store_true", help="also show median kbps per reciter")
+    p.add_argument("--json", metavar="PATH", help="write findings as JSON")
+    p.add_argument("--write-ids", metavar="PATH", help="write suspect source ids, one per line")
+    p.set_defaults(func=cmd_audit)
 
     p = sub.add_parser("manifest", help="build a manifest from a published repo")
     p.add_argument("repo", help="HF dataset repo id")

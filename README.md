@@ -76,6 +76,40 @@ warsh-data segment ./audio -o ./out --resume
 warsh-data stats ./out/segments.jsonl
 ```
 
+## Auditing the audio before you segment it
+
+```bash
+warsh-data audit ./audio --bitrates
+```
+
+Compares each recording against the median duration of the *same surah* across
+the other reciters. There is no absolute rule for how long a surah should be, but
+fifteen reciters reading the same one is all the reference needed -- a file far
+out of line with the rest is a mislabelled file, a truncated download, or a
+different recording altogether.
+
+Real example from mp3quran:
+
+```
+rachid-belalya/094   too long   surah 094 is much longer than other reciters'  (1134s vs 38s median, 29.6x)
+```
+
+Ash-Sharh is 38 seconds. That file is 19 minutes, so it is not Ash-Sharh.
+
+Files that will not decode and files of zero duration are reported first, since
+those need no comparison. A surah held by fewer than three reciters is skipped:
+with no majority, calling either one wrong is a coin flip. `--factor` sets how
+far off the median counts as suspect (default 3x, comfortably outside the ~2x
+pace variation between reciters).
+
+`--bitrates` shows median kbps per reciter, which explains small files rather
+than flagging them -- the corpus ranges from 32 to 326 kbps and all of it is
+resampled to 16 kHz mono anyway.
+
+```bash
+warsh-data audit ./audio --write-ids suspect.txt
+```
+
 ## Checking the thresholds before a full pass
 
 Reciters differ enormously in pace, and one silence floor does not fit all of
