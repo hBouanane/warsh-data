@@ -84,11 +84,12 @@ class AlignConfig:
     anchor_n: int = 4
     #: Maximum normalised distance for an anchor n-gram to count as matched.
     anchor_max_distance: float = 0.25
-    #: Word anchors are only added inside gaps at least this wide.  Swept
-    #: empirically: at 40 they fire on text that already has plenty of n-gram
-    #: anchors and cost accuracy there; at 120 they reach the refrain-heavy
-    #: surahs that need them (+4.2 pts on Ar-Rahman) for 0.4 of a point
-    #: elsewhere.
+    #: Word anchors are only added inside gaps at least this wide, so they never
+    #: compete with n-gram anchors where those are plentiful.  Swept empirically
+    #: at 40/60/80/120; 120 was best.  Their measured value has since shrunk:
+    #: most of what they used to gain on refrain-heavy surahs turned out to be
+    #: compensating for spans being clipped, and once that was fixed they are
+    #: neutral there and worth about two points on longer surahs at high error.
     min_gap_to_split: int = 120
     #: Also anchor on single words that occur exactly once in the surah.  Exact
     #: n-gram anchors vanish once the error rate is high enough that no four
@@ -650,6 +651,48 @@ def align_surah(
             ok=distance <= config.max_segment_distance,
             hypothesis=transcript,
         ))
+
+    # Waqf segments overlap.  A reciter who pauses often carries the last few
+    # words into the next segment, or repeats them, so the same words are in two
+    # recordings.  Monotonic alignment gives each reference word to exactly one
+    # segment, which clips both -- measured on 864 real segments of Al-Baqarah,
+    # my spans ran ~3 words short at the end in 49 of 69 disagreements.
+    #
+    # So let each segment claim reference words beyond its partition boundary,
+    # but only while its *own* transcript matches them better for doing so.  The
+    # evidence is per segment and local, and a segment that did not say those
+    # words cannot improve by taking them.
+    for position, result in enumerate(results):
+        if result.ref_start < 0 or result.formula:
+            continue
+        spoken = " ".join(normalizer(result.hypothesis))
+        if not spoken:
+            continue
+
+        best_end, best = result.ref_end, _distance(spoken, result.rasm)
+        limit = min(len(surah.words), result.ref_start + config.max_words_per_segment)
+        for end in range(result.ref_end + 1, limit + 1):
+            score = _distance(spoken, surah.rasm(result.ref_start, end))
+            if score < best:
+                best, best_end = score, end
+
+        best_start = result.ref_start
+        floor = max(0, best_end - config.max_words_per_segment)
+        for start in range(result.ref_start - 1, floor - 1, -1):
+            score = _distance(spoken, surah.rasm(start, best_end))
+            if score < best:
+                best, best_start = score, start
+
+        if (best_start, best_end) != (result.ref_start, result.ref_end):
+            results[position] = Aligned(
+                index=result.index, ref_start=best_start, ref_end=best_end,
+                label=surah.label(best_start, best_end),
+                rasm=surah.rasm(best_start, best_end),
+                verses=surah.verses_spanned(best_start, best_end),
+                distance=best, ok=best <= config.max_segment_distance,
+                hypothesis=result.hypothesis, formula=result.formula,
+                repeat=result.repeat,
+            )
 
     # A repeat does not always leave one segment empty: the DP will happily give
     # each copy half of the span, which looks aligned and is wrong.  Two adjacent

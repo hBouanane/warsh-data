@@ -137,31 +137,30 @@ def test_anchors_increase_in_both_sequences(text):
     assert [a[1] for a in anchors] == sorted(a[1] for a in anchors)
 
 
-def test_word_anchors_help_refrain_surahs_more_than_they_cost_elsewhere(text):
-    """Word anchors are weak evidence. In text with plenty of unique phrasing
-    they occasionally win a tie they should lose, so they are gated behind a
-    minimum gap. The gate is justified only if the trade is favourable."""
-    refrain = text[AR_RAHMAN]
-    rich = text[YA_SIN]
-    off = align.AlignConfig(word_anchors=False)
+def test_word_anchors_are_not_harmful(text):
+    """Word anchors are weak evidence, so they are gated behind a minimum gap
+    and must never cost accuracy where n-gram anchors already suffice.
 
+    They used to show a large gain on refrain-heavy surahs. Most of that was
+    compensating for spans being clipped at segment boundaries; with that fixed
+    they are neutral there, and the remaining value is on longer surahs at high
+    error rates. The test asserts what is still true: no harm, net positive.
+    """
+    off = align.AlignConfig(word_anchors=False)
     gains = []
-    for surah, rates in ((refrain, (0.30, 0.40, 0.50)), (rich, (0.20, 0.30))):
+    for number, rates in ((AR_RAHMAN, (0.30, 0.50)), (YA_SIN, (0.20, 0.30))):
+        surah = text[number]
         for rate in rates:
             case = simulate.make_case(surah, rate, seed=11, repeat_segments=4,
                                       opening=True, closing=True)
-            with_words = simulate.score_case(
+            on = simulate.score_case(
                 case, align.align_surah(surah, case.transcripts))["accuracy"]
             without = simulate.score_case(
                 case, align.align_surah(surah, case.transcripts, off))["accuracy"]
-            gains.append((surah.number, with_words - without))
+            gains.append(on - without)
 
-    on_refrain = [g for n, g in gains if n == AR_RAHMAN]
-    on_rich = [g for n, g in gains if n == YA_SIN]
-
-    assert sum(on_refrain) > 0, "no gain where they are supposed to help"
-    assert min(on_rich) >= -0.05, "too costly where n-gram anchors suffice"
-    assert sum(g for _, g in gains) > 0, "net effect must be positive"
+    assert min(gains) >= -0.02, "word anchors must not cost accuracy"
+    assert sum(gains) > 0, "net effect must remain positive"
 
 
 def test_tiny_surah(text):
@@ -213,3 +212,31 @@ def test_window_stride_never_collapses():
         stride = max(cfg.max_words_per_segment, span - 2 * cfg.max_words_per_segment)
         assert stride >= cfg.max_words_per_segment
         assert span - stride >= cfg.max_words_per_segment, "windows must overlap"
+
+
+def test_segments_may_overlap_when_the_audio_does(text):
+    """Waqf segments are not a partition. A reciter who pauses often carries the
+    last words into the next segment or repeats them, so the same reference
+    words legitimately belong to two recordings. Forcing a strict partition
+    clipped both -- measured on real segments of Al-Baqarah, spans ran about
+    three words short at the end.
+    """
+    surah = text[2]
+    # Two segments whose audio overlaps by three words, as a real reciter does.
+    first = surah.rasm(430, 442)
+    second = surah.rasm(439, 448)
+    result = align.align_surah(surah, [first, second])
+
+    a, b = result.segments
+    assert a.ref_end > b.ref_start, "an overlap in the audio must survive"
+    assert a.ref_end >= 441, f"first segment clipped at {a.ref_end}"
+    assert b.ref_start <= 440, f"second segment clipped at {b.ref_start}"
+
+
+def test_extension_cannot_invent_coverage(text):
+    """A segment may only claim extra words while its own transcript matches
+    them better for doing so, so a short recitation stays short."""
+    surah = text[2]
+    spoken = surah.rasm(1000, 1006)
+    result = align.align_surah(surah, [spoken])
+    assert result.segments[0].word_count <= 12
