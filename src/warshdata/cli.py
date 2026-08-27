@@ -123,7 +123,8 @@ def cmd_segment(args: argparse.Namespace) -> int:
         from .asr import Transcriber
 
         transcriber = Transcriber(model_id=args.asr, checkpoint=args.asr_checkpoint,
-                                  device=args.device, batch_size=args.asr_batch_size)
+                                  device=args.device, batch_size=args.asr_batch_size,
+                                  decoder=args.asr_decoder)
     reference = None
     if args.align:
         if transcriber is None:
@@ -524,7 +525,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "uses mohammed/fastconformer-quran-ar")
     p.add_argument("--asr-checkpoint", default=None,
                    help="checkpoint file inside the model repo")
-    p.add_argument("--asr-batch-size", type=int, default=16)
+    p.add_argument("--asr-batch-size", type=int, default=8)
+    p.add_argument("--asr-decoder", choices=["ctc", "rnnt"], default="ctc",
+                   help="which head of the hybrid model decodes (default: ctc, "
+                        "which has no autoregressive loop to overflow)")
     p.add_argument("--align", action="store_true",
                    help="align the transcripts to the Warsh text and label each segment")
     p.add_argument("--recheck-asr", action="store_true",

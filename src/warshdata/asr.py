@@ -46,13 +46,24 @@ class Transcriber:
     model_id: Optional[str] = None
     checkpoint: Optional[str] = None
     device: str = "cuda"
-    batch_size: int = 16
+    #: Kept small on purpose: RNNT aside, decoding cost scales with the longest
+    #: clip in the batch, and a batch of long segments is what pushes a 15 GB
+    #: card over.
+    batch_size: int = 8
     #: The published model was trained with min_duration 0.5 / max_duration 30.
     #: Handing the RNNT decoder a clip outside that range crashes it with an
     #: illegal memory access, which then poisons the CUDA context for good, so
     #: the range is enforced here rather than discovered at hour two.
     min_seconds: float = 0.5
     max_seconds: float = 30.0
+    #: Which head of the hybrid model decodes.  CTC by default, deliberately:
+    #: the RNNT decoder is autoregressive and its greedy loop allocates against
+    #: the longest clip in the batch, which is what crashes with an illegal
+    #: memory access part-way through a long surah.  CTC is one forward pass with
+    #: no decode loop, so it cannot blow up the same way.  It scores slightly
+    #: worse, which does not matter here -- the transcript only has to locate a
+    #: segment, and the label comes from the reference text either way.
+    decoder: str = "ctc"
 
     def __post_init__(self) -> None:
         self.model_id = self.model_id or DEFAULT_MODEL
@@ -68,6 +79,14 @@ class Transcriber:
         self.model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.restore_from(path)
         self.model = self.model.to(self.device)
         self.model.eval()
+
+        if self.decoder:
+            try:
+                self.model.change_decoding_strategy(decoder_type=self.decoder)
+            except Exception as exc:      # not a hybrid model, or older NeMo
+                print(f"could not select the {self.decoder} decoder ({exc}); "
+                      f"using the model default")
+
         self._torch = torch
 
     def transcribe(self, waves: Sequence[np.ndarray]) -> List[str]:

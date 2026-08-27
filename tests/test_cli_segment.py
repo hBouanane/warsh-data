@@ -352,8 +352,10 @@ class FakeTranscriber:
     made: list["FakeTranscriber"] = []
     texts: list[str] = []
 
-    def __init__(self, model_id=None, checkpoint=None, device=None, batch_size=None):
+    def __init__(self, model_id=None, checkpoint=None, device=None,
+                 batch_size=None, decoder=None):
         self.model_id = model_id
+        self.decoder = decoder
         self.calls = 0
         FakeTranscriber.made.append(self)
 
@@ -452,3 +454,13 @@ def test_a_dead_cuda_context_stops_the_run(fake_segment_module, tmp_path, monkey
     run(["segment", str(audio), "-o", str(out), "--no-clips"])
 
     assert calls == ["ibrahim-aldosari/001", "ibrahim-aldosari/002"], calls
+
+
+def test_ctc_is_the_default_decoder(fake_segment_module, fake_asr, tmp_path):
+    """The RNNT head decodes autoregressively and its greedy loop allocates
+    against the longest clip in the batch, which is what crashed mid-corpus.
+    CTC is one forward pass and cannot overflow the same way."""
+    fake_asr.texts = ["x"]
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    run(["segment", str(audio), "-o", str(tmp_path / "out"), "--no-clips", "--asr"])
+    assert fake_asr.made[0].decoder == "ctc"
