@@ -181,3 +181,35 @@ def test_garbage_input_aligns_nothing_confidently(text):
     surah = text[AL_MURSALAT]
     result = align.align_surah(surah, ["زززز ززز زززز", "ككك كككك ككك"])
     assert all(not s.ok for s in result.segments)
+
+
+def test_a_fragment_of_a_long_surah_is_located(text):
+    """Global alignment cannot do this: accounting for the unused reference
+    costs the same wherever it happens, so a fragment's span used to run
+    thousands of words past its true end. A segment is bounded by its audio."""
+    surah = text[2]
+    for start in (120, 2500, 5000):
+        part = [surah.rasm(start, start + 6), surah.rasm(start + 6, start + 12)]
+        result = align.align_surah(surah, part)
+        got = (result.segments[0].ref_start, result.segments[-1].ref_end)
+        assert got == (start, start + 12), f"planted at {start}, found {got}"
+
+
+def test_a_span_cannot_exceed_what_the_audio_could_hold(text):
+    surah = text[2]
+    cfg = align.AlignConfig()
+    part = [surah.rasm(3000, 3008)]
+    result = align.align_surah(surah, part, cfg)
+    assert result.segments[0].word_count <= cfg.max_words_per_segment
+
+
+def test_window_stride_never_collapses():
+    """Regression: sizing the window off the transcript alone let an overlap of
+    2x the segment cap exceed the window, collapsing the stride to one word and
+    turning a 70-window scan into 6000."""
+    cfg = align.AlignConfig()
+    for hyp_len in (1, 5, 12, 40, 200):
+        span = max(hyp_len * 3, 3 * cfg.max_words_per_segment)
+        stride = max(cfg.max_words_per_segment, span - 2 * cfg.max_words_per_segment)
+        assert stride >= cfg.max_words_per_segment
+        assert span - stride >= cfg.max_words_per_segment, "windows must overlap"

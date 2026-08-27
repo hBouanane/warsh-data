@@ -112,6 +112,16 @@ class AlignConfig:
     #: How similar two adjacent transcripts must be to count as one passage
     #: recited twice rather than two different passages that happen to adjoin.
     repeat_max_distance: float = 0.35
+    #: Most reference words one segment can possibly cover.  A segment is capped
+    #: at 40 s of audio, and nobody recites faster than about two words a second,
+    #: so this is a fact about the recording rather than a tuning knob.  It is
+    #: what stops a span running away: however tempting a distant match looks, a
+    #: segment cannot span half a surah.
+    max_words_per_segment: int = 80
+    #: When the reference is at least this many times longer than the whole
+    #: transcript, the recitation is a fragment of the surah rather than all of
+    #: it, and the window search below is used to locate it first.
+    partial_ratio: float = 4.0
 
 
 @dataclass
@@ -169,6 +179,30 @@ def _trim_outliers(hits: List[int], word_count: int, slack: int = 10) -> List[in
     median = ordered[len(ordered) // 2]
     reach = max(word_count * 3, word_count + slack)
     return [h for h in hits if abs(h - median) <= reach] or [median]
+
+
+def _bounded_span(hits: List[int], max_words: int) -> Tuple[int, int]:
+    """Tightest window of at most ``max_words`` holding the most matches.
+
+    The cap is physical -- a segment is at most 40 s of audio -- so a span wider
+    than that is not a long segment, it is a stray match pulling the boundary
+    away.  Where the cap bites, the densest run wins.
+    """
+    ordered = sorted(hits)
+    if not ordered:
+        return -1, -1
+    if ordered[-1] - ordered[0] < max_words:
+        return ordered[0], ordered[-1] + 1
+
+    best_count, best = -1, (ordered[0], ordered[0] + 1)
+    right = 0
+    for left in range(len(ordered)):
+        while right < len(ordered) and ordered[right] - ordered[left] < max_words:
+            right += 1
+        if right - left > best_count:
+            best_count = right - left
+            best = (ordered[left], ordered[right - 1] + 1)
+    return best
 
 
 def _distance(a: str, b: str) -> float:
@@ -407,6 +441,66 @@ def strip_formulas(
     return taken
 
 
+def locate_window(ref: Sequence[str], hyp: Sequence[str], config: AlignConfig
+                  ) -> Tuple[int, int]:
+    """Find the stretch of reference a short transcript came from.
+
+    Global alignment cannot do this.  Accounting for every unused reference word
+    costs the same wherever those words are, so with a fragment against a long
+    surah the placement is nearly free and stray matches scatter across the
+    whole text -- the start comes out right and the end runs thousands of words
+    away.
+
+    A recitation is bounded by its own audio, though: 40 s of speech is at most
+    a few dozen words.  So slide a window a few times that size, score each one
+    independently, and keep the best.  Windows overlap by twice the longest
+    single segment, so a passage straddling a boundary is still wholly inside
+    some window.  Scoring them independently is what keeps this safe -- there is
+    no cursor to carry a mistake forward.
+    """
+    if not hyp or not ref:
+        return 0, len(ref)
+
+    # The window must be at least three times the longest single segment, so
+    # that an overlap of twice that still leaves a stride worth taking.  Sizing
+    # it off the transcript alone lets the overlap swallow the window and the
+    # stride collapse to one word.
+    span = max(len(hyp) * 3, 3 * config.max_words_per_segment)
+    if len(ref) <= span:
+        return 0, len(ref)
+
+    overlap = 2 * config.max_words_per_segment
+    stride = max(config.max_words_per_segment, span - overlap)
+
+    best: Optional[Tuple[float, int, int]] = None
+    for start in range(0, len(ref), stride):
+        end = min(start + span, len(ref))
+        window = ref[start:end]
+        if len(window) < len(hyp):
+            continue
+        mapping = _dp_align(window, hyp)
+        matched = [m for m in mapping if m is not None]
+        if not matched:
+            continue
+        cost = sum(
+            _distance(hyp[i], window[m])
+            for i, m in enumerate(mapping) if m is not None
+        )
+        # Unmatched transcript words are the expensive part: a window that
+        # explains more of what was actually said is the better window.
+        score = (cost + (len(hyp) - len(matched)) * GAP_COST) / len(hyp)
+        if best is None or score < best[0]:
+            best = (score, start, end)
+        if end >= len(ref):
+            break
+
+    if best is None:
+        return 0, len(ref)
+    _, start, end = best
+    pad = config.max_words_per_segment
+    return max(0, start - pad), min(len(ref), end + pad)
+
+
 def align_words(ref: Sequence[str], hyp: Sequence[str],
                 config: Optional[AlignConfig] = None) -> Tuple[List[Optional[int]], int]:
     """Align two word sequences.  Returns ``(mapping, anchor_count)``."""
@@ -497,8 +591,17 @@ def align_surah(
         formula_words = set(range(lead)) | set(range(len(hyp_words) - tail, len(hyp_words)))
 
     kept = [i for i in range(len(hyp_words)) if i not in formula_words]
+    kept_words = [hyp_words[i] for i in kept]
+
+    # A fragment of a long surah has to be located before it can be aligned.
+    offset, limit = 0, len(surah.words)
+    if kept_words and len(surah.words) > config.partial_ratio * len(kept_words):
+        offset, limit = locate_window(surah.words, kept_words, config)
+
     mapping_kept, anchor_count = align_words(
-        surah.words, [hyp_words[i] for i in kept], config)
+        surah.words[offset:limit], kept_words, config)
+    if offset:
+        mapping_kept = [None if m is None else m + offset for m in mapping_kept]
 
     mapping: List[Optional[int]] = [None] * len(hyp_words)
     for position, hyp_index in enumerate(kept):
@@ -530,7 +633,7 @@ def align_surah(
             continue
 
         hits = _trim_outliers(hits, len(normalizer(transcript)))
-        start, end = min(hits), max(hits) + 1
+        start, end = _bounded_span(hits, config.max_words_per_segment)
         covered.update(range(start, end))
         ref_rasm = surah.rasm(start, end)
         hyp_rasm = " ".join(normalizer(transcript))
