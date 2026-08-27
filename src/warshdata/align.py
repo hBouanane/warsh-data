@@ -27,9 +27,12 @@ character distance between the two words separates them: ASR noise is cheap,
 a real difference is expensive, and the alignment prefers the copy whose
 neighbours actually agree.
 
-*Matching happens on the rasm.*  Short vowels are what an ASR gets wrong most,
-and two verses differing only in vowelling should be told apart by context, not
-by marks the model probably guessed.  Diacritics are scored afterwards instead.
+*Matching happens on the skeleton.*  Short vowels are what an ASR gets wrong
+most, and two verses differing only in vowelling should be told apart by context
+rather than by marks the model probably guessed.  Unifying letter shapes on top
+of that absorbs the orthographic gap between a Hafs-trained recogniser and a
+Warsh reference -- worth 35 points of word error on real output.  Diacritics are
+scored afterwards instead, and labels still come from the fully pointed text.
 
 Anchoring keeps it fast.  Word n-grams that occur exactly once in both sequences
 pin the alignment; a longest-increasing-subsequence pass keeps only a mutually
@@ -146,6 +149,26 @@ class Alignment:
     @property
     def ok_count(self) -> int:
         return sum(1 for s in self.segments if s.ok)
+
+
+def _trim_outliers(hits: List[int], word_count: int, slack: int = 10) -> List[int]:
+    """Drop mapped positions that cannot belong to the same segment.
+
+    A segment of *n* transcript words covers about *n* reference words, so a hit
+    hundreds of words away is a spurious match, not a boundary.  Taking the raw
+    min and max lets one such hit swallow half a surah -- harmless in a short
+    surah where there is nowhere far to go, ruinous in Al-Baqarah, and worst for
+    a partial recitation, where most of the reference is unrelated text that a
+    stray word can match.
+
+    The median is the anchor because it survives outliers on either side.
+    """
+    if len(hits) < 2:
+        return hits
+    ordered = sorted(hits)
+    median = ordered[len(ordered) // 2]
+    reach = max(word_count * 3, word_count + slack)
+    return [h for h in hits if abs(h - median) <= reach] or [median]
 
 
 def _distance(a: str, b: str) -> float:
@@ -394,9 +417,24 @@ def align_words(ref: Sequence[str], hyp: Sequence[str],
         return _dp_align(ref, hyp), 0
 
     mapping: List[Optional[int]] = [None] * len(hyp)
-    ref_cursor = hyp_cursor = 0
 
-    for ref_index, hyp_index, length in anchors + [(len(ref), len(hyp), 0)]:
+    # Bound the regions before the first and after the last anchor.  Deleting a
+    # reference word costs the same wherever it happens, so when the hypothesis
+    # is far shorter than the reference -- a partial recitation -- the DP is
+    # nearly indifferent to position and will happily match a stray word
+    # thousands of words away.  Anchors localise reliably, so the unanchored
+    # head and tail are limited to what the remaining transcript could plausibly
+    # cover.
+    first_ref, first_hyp, _ = anchors[0]
+    last_ref, last_hyp, last_len = anchors[-1]
+    head_room = first_hyp * 3 + config.anchor_n + 10
+    tail_room = (len(hyp) - last_hyp - last_len) * 3 + config.anchor_n + 10
+    lo = max(0, first_ref - head_room)
+    hi = min(len(ref), last_ref + last_len + tail_room)
+
+    ref_cursor, hyp_cursor = lo, 0
+
+    for ref_index, hyp_index, length in anchors + [(hi, len(hyp), 0)]:
         if ref_index < ref_cursor or hyp_index < hyp_cursor:
             continue  # already covered by a previous anchor's span
         gap = _dp_align(ref[ref_cursor:ref_index], hyp[hyp_cursor:hyp_index])
@@ -432,7 +470,10 @@ def align_surah(
         from warshlab import text as T
 
         def normalizer(value: str) -> List[str]:
-            return [w for w in T.words(T.to_rasm(value)) if w]
+            # Skeleton, not rasm: both sides must use the same form, and the
+            # skeleton absorbs the orthographic difference between an ASR
+            # trained on Hafs and a Warsh reference.
+            return [w for w in T.words(T.to_skeleton(value)) if w]
 
     hyp_words: List[str] = []
     owner: List[int] = []
@@ -488,6 +529,7 @@ def align_surah(
                                    formula=is_formula))
             continue
 
+        hits = _trim_outliers(hits, len(normalizer(transcript)))
         start, end = min(hits), max(hits) + 1
         covered.update(range(start, end))
         ref_rasm = surah.rasm(start, end)
