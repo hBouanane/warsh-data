@@ -203,6 +203,11 @@ def cmd_segment(args: argparse.Namespace) -> int:
                 # every source after this one would fail too.  Stopping keeps
                 # the failure to one file instead of the whole remaining run;
                 # --resume picks up from here after a restart.
+                if transcriber is not None:
+                    print("", file=sys.stderr)
+                    print("Allocator state at the failure:", file=sys.stderr)
+                    print(transcriber.memory().line(), file=sys.stderr)
+                    print(transcriber.memory_summary(), file=sys.stderr)
                 print("\nCUDA context is unrecoverable -- stopping. Restart the "
                       "runtime and re-run with --resume.", file=sys.stderr)
                 break

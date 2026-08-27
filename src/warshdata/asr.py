@@ -18,11 +18,36 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-__all__ = ["Transcriber", "DEFAULT_MODEL", "DEFAULT_CHECKPOINT"]
+__all__ = ["Transcriber", "DEFAULT_MODEL", "DEFAULT_CHECKPOINT", "MemoryReport"]
 
 DEFAULT_MODEL = "mohammed/fastconformer-quran-ar"
 DEFAULT_CHECKPOINT = "phase3_full/phase3_full_wer0.0014.nemo"
 SAMPLE_RATE = 16000
+
+
+@dataclass
+class MemoryReport:
+    """A snapshot of the card, for telling fragmentation from a leak.
+
+    ``allocated`` is what tensors actually hold; ``reserved`` is what the
+    allocator has taken from the device.  The gap between them is memory the
+    process owns but cannot use, which is what fragmentation looks like.  If
+    ``allocated`` stays flat across sources while ``reserved`` climbs, the
+    allocator is fragmenting; if ``allocated`` climbs too, something is holding
+    references between sources.
+    """
+
+    allocated: float = 0.0
+    reserved: float = 0.0
+    peak: float = 0.0
+
+    @property
+    def fragmentation(self) -> float:
+        return max(0.0, self.reserved - self.allocated)
+
+    def line(self) -> str:
+        return (f"alloc {self.allocated:5.2f} GB  reserved {self.reserved:5.2f} GB  "
+                f"peak {self.peak:5.2f} GB  frag {self.fragmentation:5.2f} GB")
 
 
 def _as_text(result) -> str:
@@ -129,6 +154,27 @@ class Transcriber:
         for position, text in zip(positions, texts_by_slot):
             out[position] = text
         return out
+
+    def memory(self) -> MemoryReport:
+        """Current allocator state, in gigabytes.  Zeroed when not on CUDA."""
+        try:
+            if not self._torch.cuda.is_available() or self.device == "cpu":
+                return MemoryReport()
+            gib = 1024 ** 3
+            return MemoryReport(
+                allocated=self._torch.cuda.memory_allocated() / gib,
+                reserved=self._torch.cuda.memory_reserved() / gib,
+                peak=self._torch.cuda.max_memory_reserved() / gib,
+            )
+        except Exception:
+            return MemoryReport()
+
+    def memory_summary(self) -> str:
+        """Block-level allocator dump, for reading after a crash."""
+        try:
+            return self._torch.cuda.memory_summary()
+        except Exception as exc:
+            return f"(no memory summary available: {exc})"
 
     def _free(self) -> None:
         """Release cached blocks between batches.

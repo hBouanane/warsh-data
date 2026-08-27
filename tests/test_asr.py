@@ -69,3 +69,41 @@ def test_over_long_clips_are_skipped_not_truncated():
     out = t.transcribe([clip(45.0), clip(3.0)])
     assert t.seen == [48000], "only the in-range clip should reach the model"
     assert out == ["", "t0"]
+
+
+def test_memory_report_separates_fragmentation_from_use():
+    """reserved minus allocated is memory the process owns but cannot use --
+    the number that distinguishes a fragmenting allocator from a leak."""
+    from warshdata.asr import MemoryReport
+
+    report = MemoryReport(allocated=3.0, reserved=11.5, peak=12.0)
+    assert report.fragmentation == pytest.approx(8.5)
+    assert "frag  8.50 GB" in report.line()
+    assert "alloc  3.00 GB" in report.line()
+
+
+def test_memory_report_is_never_negative():
+    from warshdata.asr import MemoryReport
+
+    assert MemoryReport(allocated=5.0, reserved=4.0).fragmentation == 0.0
+
+
+def test_memory_probe_survives_a_missing_cuda():
+    """The probe must never be the thing that breaks a run."""
+    class NoCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+        @staticmethod
+        def memory_summary():
+            raise RuntimeError("no device")
+
+    class Torch:
+        cuda = NoCuda
+
+    probe = Fake()
+    probe._torch = Torch
+    probe.device = "cuda"
+    assert probe.memory().allocated == 0.0
+    assert "no memory summary" in probe.memory_summary()
