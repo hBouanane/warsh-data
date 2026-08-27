@@ -56,14 +56,10 @@ class Transcriber:
     #: the range is enforced here rather than discovered at hour two.
     min_seconds: float = 0.5
     max_seconds: float = 30.0
-    #: Which head of the hybrid model decodes.  CTC by default, deliberately:
-    #: the RNNT decoder is autoregressive and its greedy loop allocates against
-    #: the longest clip in the batch, which is what crashes with an illegal
-    #: memory access part-way through a long surah.  CTC is one forward pass with
-    #: no decode loop, so it cannot blow up the same way.  It scores slightly
-    #: worse, which does not matter here -- the transcript only has to locate a
-    #: segment, and the label comes from the reference text either way.
-    decoder: str = "ctc"
+    #: Which head of the hybrid model decodes.  RNNT scores better; CTC is the
+    #: fallback if RNNT keeps crashing, since it is one forward pass with no
+    #: autoregressive loop to overflow.
+    decoder: str = "rnnt"
 
     def __post_init__(self) -> None:
         self.model_id = self.model_id or DEFAULT_MODEL
@@ -116,17 +112,40 @@ class Transcriber:
         if not usable:
             return [""] * len(waves)
 
-        texts = self._run(usable)
+        # Group clips of similar length together.  RNNT decodes greedily to the
+        # longest clip in a batch, so mixing a one-second clip with a
+        # twenty-nine-second one makes every clip in that batch pay the long
+        # one's decode loop -- wasted work, and the peak allocation that takes
+        # the card down mid-corpus.
+        order = sorted(range(len(usable)), key=lambda i: usable[i].size)
+        texts_by_slot = [""] * len(usable)
+        for start in range(0, len(order), self.batch_size):
+            chunk = order[start:start + self.batch_size]
+            for slot, text in zip(chunk, self._run([usable[i] for i in chunk])):
+                texts_by_slot[slot] = text
+            self._free()
+
         out = [""] * len(waves)
-        for position, text in zip(positions, texts):
+        for position, text in zip(positions, texts_by_slot):
             out[position] = text
         return out
+
+    def _free(self) -> None:
+        """Release cached blocks between batches.
+
+        Two models sit on the card at once here -- the segmenter and this one --
+        so the allocator has less room to work with than either expects.
+        """
+        try:
+            self._torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _run(self, waves: Sequence[np.ndarray]) -> List[str]:
         try:
             with self._torch.no_grad():
                 results = self.model.transcribe(
-                    list(waves), batch_size=self.batch_size, verbose=False,
+                    list(waves), batch_size=len(waves), verbose=False,
                 )
             return [_as_text(r) for r in results]
         except (TypeError, ValueError, AttributeError):

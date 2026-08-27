@@ -418,8 +418,11 @@ def test_align_labels_from_the_reference_not_the_asr(fake_segment_module, fake_a
     assert labelled, "alignment produced no labels"
     for record in labelled:
         assert "قد" not in record["label"], "the ASR's error leaked into the label"
-        assert record["ayah_start"] is not None
         assert record["align_distance"] is not None
+        # A segment sitting on the prepended opening is a formula and has no
+        # ayah of its own; only recitation carries verse numbers.
+        if not record["is_formula"]:
+            assert record["ayah_start"] is not None
 
 
 @pytest.mark.parametrize("message,fatal", [
@@ -456,11 +459,11 @@ def test_a_dead_cuda_context_stops_the_run(fake_segment_module, tmp_path, monkey
     assert calls == ["ibrahim-aldosari/001", "ibrahim-aldosari/002"], calls
 
 
-def test_ctc_is_the_default_decoder(fake_segment_module, fake_asr, tmp_path):
-    """The RNNT head decodes autoregressively and its greedy loop allocates
-    against the longest clip in the batch, which is what crashed mid-corpus.
-    CTC is one forward pass and cannot overflow the same way."""
+def test_rnnt_is_the_default_decoder(fake_segment_module, fake_asr, tmp_path):
+    """RNNT scores better, so it stays the default. CTC is the fallback for when
+    the greedy decode loop overflows -- length-bucketed batches and a smaller
+    batch size are what keep RNNT usable."""
     fake_asr.texts = ["x"]
     audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
     run(["segment", str(audio), "-o", str(tmp_path / "out"), "--no-clips", "--asr"])
-    assert fake_asr.made[0].decoder == "ctc"
+    assert fake_asr.made[0].decoder == "rnnt"

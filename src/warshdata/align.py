@@ -560,6 +560,75 @@ def align_words(ref: Sequence[str], hyp: Sequence[str],
     return mapping, len(anchors)
 
 
+class _WithOpening:
+    """A surah with the spoken opening formulas prepended to its text.
+
+    Stripping the formulas off the transcript only works when they arrive as
+    their own segment.  In practice a reciter runs the basmala straight into the
+    first verse, the recogniser returns them as one string, and there is nothing
+    cleanly separable to remove -- so the formula gets forced onto real verse
+    text and drags the alignment with it.
+
+    Putting them in the *reference* instead makes the whole problem ordinary
+    alignment: said them, and they match; ran them together with the first
+    verse, and the span simply covers both; skipped them, and those reference
+    words go unmatched like any other. Nothing has to be detected.
+    """
+
+    def __init__(self, surah, prefix_words: List[str], prefix_labels: List[str]):
+        self.surah = surah
+        self.number = surah.number
+        self.verses = surah.verses
+        self.offset = len(prefix_words)
+        self._prefix_labels = prefix_labels
+        self.words = prefix_words + surah.words
+
+    def _slice(self, start: int, end: int, source: List[str], body) -> str:
+        start, end = max(0, start), min(end, len(self.words))
+        if end <= start:
+            return ""
+        head = source[start:min(end, self.offset)] if start < self.offset else []
+        tail = body(max(0, start - self.offset), end - self.offset) if end > self.offset else ""
+        return " ".join([*head, tail]).strip()
+
+    def label(self, start: int, end: int) -> str:
+        return self._slice(start, end, self._prefix_labels, self.surah.label)
+
+    def rasm(self, start: int, end: int) -> str:
+        return self._slice(start, end, self.words, self.surah.rasm)
+
+    def verses_spanned(self, start: int, end: int) -> List[int]:
+        if end <= self.offset:
+            return []
+        return self.surah.verses_spanned(max(0, start - self.offset), end - self.offset)
+
+
+def _opening_prefix(surah, normalizer) -> Tuple[List[str], List[str]]:
+    """Words a reciter may say before the text, and their pointed forms.
+
+    Al-Fatiha gets no basmala: it is verse 1:1 there, and adding it again would
+    let a segment match the wrong copy.  At-Tawbah has none at all.
+    """
+    words: List[str] = []
+    labels: List[str] = []
+
+    for phrase, pointed in ((ISTIADHA[0], ISTIADHA_LABEL),):
+        tokens = normalizer(phrase)
+        pointed_tokens = pointed.split()
+        if len(tokens) == len(pointed_tokens):
+            words.extend(tokens)
+            labels.extend(pointed_tokens)
+
+    if surah.number not in (1, 9):
+        tokens = normalizer(BASMALA)
+        pointed_tokens = surah_basmala(surah).split()
+        if len(tokens) == len(pointed_tokens):
+            words.extend(tokens)
+            labels.extend(pointed_tokens)
+
+    return words, labels
+
+
 def _formula_label(transcript: str, surah, normalizer) -> str:
     """Pointed text for whichever formula this segment is.
 
@@ -620,40 +689,24 @@ def align_surah(
             hyp_words.append(word)
             owner.append(index)
 
-    formula_words: set = set()
+    target = surah
+    offset = 0
     if config.strip_opening:
-        openings = [normalizer(f) for f in ISTIADHA]
-        # In Al-Fatiha the basmala *is* verse 1, so stripping it would delete
-        # real reference text.  Everywhere else it precedes the text.
-        if surah.number != 1:
-            openings.append(normalizer(BASMALA))
-        openings = [f for f in openings if f]
+        prefix_words, prefix_labels = _opening_prefix(surah, normalizer)
+        if prefix_words:
+            target = _WithOpening(surah, prefix_words, prefix_labels)
+            offset = target.offset
 
-        lead = strip_formulas(hyp_words, openings, config.formula_max_distance)
-        tail = strip_formulas(hyp_words, [normalizer(f) for f in CLOSING],
-                              config.formula_max_distance, from_end=True)
-        formula_words = set(range(lead)) | set(range(len(hyp_words) - tail, len(hyp_words)))
+    # A fragment of a long surah still has to be located before it is aligned:
+    # accounting for the unused reference costs the same wherever it happens, so
+    # without this the span runs far past its true end.
+    low, high = 0, len(target.words)
+    if hyp_words and len(target.words) > config.partial_ratio * len(hyp_words):
+        low, high = locate_window(target.words, hyp_words, config)
 
-    kept = [i for i in range(len(hyp_words)) if i not in formula_words]
-    kept_words = [hyp_words[i] for i in kept]
-
-    # A fragment of a long surah has to be located before it can be aligned.
-    offset, limit = 0, len(surah.words)
-    if kept_words and len(surah.words) > config.partial_ratio * len(kept_words):
-        offset, limit = locate_window(surah.words, kept_words, config)
-
-    mapping_kept, anchor_count = align_words(
-        surah.words[offset:limit], kept_words, config)
-    if offset:
-        mapping_kept = [None if m is None else m + offset for m in mapping_kept]
-
-    mapping: List[Optional[int]] = [None] * len(hyp_words)
-    for position, hyp_index in enumerate(kept):
-        mapping[hyp_index] = mapping_kept[position]
-
-    formula_segments = {
-        owner[i] for i in formula_words
-    } - {owner[i] for i in kept}
+    mapping, anchor_count = align_words(target.words[low:high], hyp_words, config)
+    if low:
+        mapping = [None if m is None else m + low for m in mapping]
 
     spans: Dict[int, List[int]] = defaultdict(list)
     for hyp_index, ref_index in enumerate(mapping):
@@ -667,33 +720,33 @@ def align_surah(
     for index, transcript in enumerate(transcripts):
         hits = spans.get(index)
         if not hits:
-            is_formula = index in formula_segments
-            if not is_formula:
-                unaligned.append(index)
-            label = _formula_label(transcript, surah, normalizer) if is_formula else ""
-            results.append(Aligned(index=index, ref_start=-1, ref_end=-1, label=label,
-                                   rasm="", verses=[], distance=0.0 if is_formula else 1.0,
-                                   ok=is_formula, hypothesis=transcript,
-                                   formula=is_formula))
+            unaligned.append(index)
+            results.append(Aligned(index=index, ref_start=-1, ref_end=-1, label="",
+                                   rasm="", verses=[], distance=1.0,
+                                   ok=False, hypothesis=transcript))
             continue
 
         hits = _trim_outliers(hits, len(normalizer(transcript)))
         start, end = _bounded_span(hits, config.max_words_per_segment)
         covered.update(range(start, end))
-        ref_rasm = surah.rasm(start, end)
+        ref_rasm = target.rasm(start, end)
         hyp_rasm = " ".join(normalizer(transcript))
         distance = _distance(hyp_rasm, ref_rasm)
 
+        # A span that lies wholly inside the prepended opening is a formula,
+        # not recitation; one that straddles the join is both, and keeps the
+        # text of both.
         results.append(Aligned(
             index=index,
-            ref_start=start,
-            ref_end=end,
-            label=surah.label(start, end),
+            ref_start=max(0, start - offset),
+            ref_end=max(0, end - offset),
+            label=target.label(start, end),
             rasm=ref_rasm,
-            verses=surah.verses_spanned(start, end),
+            verses=target.verses_spanned(start, end),
             distance=distance,
             ok=distance <= config.max_segment_distance,
             hypothesis=transcript,
+            formula=(end <= offset),
         ))
 
     # Waqf segments overlap.  A reciter who pauses often carries the last few
@@ -807,7 +860,8 @@ def align_surah(
                     unaligned.remove(result.index)
                 break
 
-    coverage = len(covered) / len(surah.words) if surah.words else 0.0
+    body_covered = {i for i in covered if i >= offset}
+    coverage = len(body_covered) / len(surah.words) if surah.words else 0.0
     scored = [r.distance for r in results if r.ref_start >= 0]
     return Alignment(
         surah=surah.number,

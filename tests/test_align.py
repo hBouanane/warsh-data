@@ -84,14 +84,32 @@ def test_long_surah_is_accurate_and_fast(text):
     assert time.time() - started < 20
 
 
-def test_istiadha_and_basmala_are_stripped(text):
+def test_opening_formulas_are_labelled_not_discarded(text):
+    """The formulas are prepended to the reference rather than stripped off the
+    transcript. Stripping only worked when a formula arrived as its own segment;
+    a reciter who runs the basmala into the first verse gave the recogniser one
+    inseparable string, and the label lost the basmala entirely."""
     surah = text[YA_SIN]
     case = simulate.make_case(surah, 0.0, seed=4, opening=True)
     result = align.align_surah(surah, case.transcripts)
 
-    assert result.segments[0].formula, "isti'adha should not be aligned to text"
-    assert result.segments[1].formula, "basmala should not be aligned to text"
+    first, second = result.segments[0], result.segments[1]
+    assert first.formula and second.formula, "both openings should be marked"
+    assert "أَعُوذُ" in first.label, first.label
+    assert "بِسْمِ" in second.label, second.label
     assert simulate.score_case(case, result)["accuracy"] == 1.0
+
+
+def test_a_formula_run_into_the_first_verse_keeps_both(text):
+    """The case that broke: basmala and the opening of the surah in one segment.
+    The label has to carry both, not just the Quranic half."""
+    surah = text[2]
+    spoken = align.BASMALA + " " + surah.rasm(0, 4)
+    result = align.align_surah(surah, [spoken, surah.rasm(4, 10)])
+
+    label = result.segments[0].label
+    assert "بِسْمِ" in label, f"basmala dropped from the label: {label}"
+    assert surah.raw_words[0].split()[0][:3] in label, label
 
 
 def test_basmala_is_kept_in_al_fatiha(text):

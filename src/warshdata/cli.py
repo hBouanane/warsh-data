@@ -526,9 +526,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--asr-checkpoint", default=None,
                    help="checkpoint file inside the model repo")
     p.add_argument("--asr-batch-size", type=int, default=8)
-    p.add_argument("--asr-decoder", choices=["ctc", "rnnt"], default="ctc",
-                   help="which head of the hybrid model decodes (default: ctc, "
-                        "which has no autoregressive loop to overflow)")
+    p.add_argument("--asr-decoder", choices=["rnnt", "ctc"], default="rnnt",
+                   help="which head of the hybrid model decodes; ctc is the fallback "
+                        "if rnnt keeps crashing")
     p.add_argument("--align", action="store_true",
                    help="align the transcripts to the Warsh text and label each segment")
     p.add_argument("--recheck-asr", action="store_true",

@@ -118,7 +118,10 @@ def make_case(
         # text does not contain: isti'adha, then basmala.
         from .align import BASMALA, ISTIADHA
 
-        for phrase in (ISTIADHA[0], BASMALA):
+        # Inserted back to front so the spoken order survives: isti'adha is
+        # said first, then the basmala.  Inserting them front to back at index 0
+        # reverses them, which is not what any reciter does.
+        for phrase in (BASMALA, ISTIADHA[0]):
             transcripts.insert(0, phrase)
             truth.insert(0, (-1, -1))
 
