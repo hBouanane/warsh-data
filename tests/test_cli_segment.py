@@ -418,3 +418,37 @@ def test_align_labels_from_the_reference_not_the_asr(fake_segment_module, fake_a
         assert "قد" not in record["label"], "the ASR's error leaked into the label"
         assert record["ayah_start"] is not None
         assert record["align_distance"] is not None
+
+
+@pytest.mark.parametrize("message,fatal", [
+    ("CUDA error: an illegal memory access was encountered", True),
+    ("CUDA error: device-side assert triggered", True),
+    ("CUDA out of memory. Tried to allocate 2.00 GiB", False),
+    ("some unrelated failure", False),
+])
+def test_only_context_killing_cuda_errors_stop_the_run(message, fatal):
+    from warshdata.cli import _is_cuda_fatal
+
+    assert _is_cuda_fatal(RuntimeError(message)) is fatal
+
+
+def test_a_dead_cuda_context_stops_the_run(fake_segment_module, tmp_path, monkeypatch):
+    """An illegal memory access leaves every later call failing too, so marching
+    on burns the rest of the corpus reporting failures it cannot avoid."""
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1, 2, 3, 4, 5))
+    out = tmp_path / "out"
+
+    mod = sys.modules["warshdata.segment"]
+    original = mod.Segmenter.segment
+    calls = []
+
+    def poisoned(self, source, clips_dir=None):
+        calls.append(source.source_id)
+        if source.path.stem == "002":
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        return original(self, source, clips_dir=clips_dir)
+
+    monkeypatch.setattr(mod.Segmenter, "segment", poisoned)
+    run(["segment", str(audio), "-o", str(out), "--no-clips"])
+
+    assert calls == ["ibrahim-aldosari/001", "ibrahim-aldosari/002"], calls

@@ -47,6 +47,12 @@ class Transcriber:
     checkpoint: Optional[str] = None
     device: str = "cuda"
     batch_size: int = 16
+    #: The published model was trained with min_duration 0.5 / max_duration 30.
+    #: Handing the RNNT decoder a clip outside that range crashes it with an
+    #: illegal memory access, which then poisons the CUDA context for good, so
+    #: the range is enforced here rather than discovered at hour two.
+    min_seconds: float = 0.5
+    max_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         self.model_id = self.model_id or DEFAULT_MODEL
@@ -67,19 +73,39 @@ class Transcriber:
     def transcribe(self, waves: Sequence[np.ndarray]) -> List[str]:
         """One transcript per waveform, in order.
 
-        Prefers handing NeMo the arrays directly; older versions only accept
-        file paths, so those are written to a temporary directory rather than
-        left to fail.
+        Clips too short to transcribe come back empty; clips longer than the
+        model's training range are truncated for recognition only.  The full
+        audio still reaches the dataset -- a shortened transcript is enough to
+        locate the segment, and the label comes from the reference text anyway.
         """
         if not waves:
             return []
 
+        floor = int(self.min_seconds * SAMPLE_RATE)
+        ceiling = int(self.max_seconds * SAMPLE_RATE)
+
+        usable, positions = [], []
+        for index, wave in enumerate(waves):
+            array = np.asarray(wave, dtype=np.float32).reshape(-1)
+            if array.size < floor:
+                continue
+            usable.append(array[:ceiling] if array.size > ceiling else array)
+            positions.append(index)
+
+        if not usable:
+            return [""] * len(waves)
+
+        texts = self._run(usable)
+        out = [""] * len(waves)
+        for position, text in zip(positions, texts):
+            out[position] = text
+        return out
+
+    def _run(self, waves: Sequence[np.ndarray]) -> List[str]:
         try:
             with self._torch.no_grad():
                 results = self.model.transcribe(
-                    [np.asarray(w, dtype=np.float32) for w in waves],
-                    batch_size=self.batch_size,
-                    verbose=False,
+                    list(waves), batch_size=self.batch_size, verbose=False,
                 )
             return [_as_text(r) for r in results]
         except (TypeError, ValueError, AttributeError):

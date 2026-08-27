@@ -15,6 +15,16 @@ from .align import align_surah
 from .sources import discover
 
 
+def _is_cuda_fatal(exc: BaseException) -> bool:
+    """True for CUDA errors that leave the context dead rather than the call."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "cuda" in text and any(
+        marker in text
+        for marker in ("illegal memory access", "device-side assert",
+                       "unspecified launch failure", "uncorrectable")
+    )
+
+
 def _surah_of(source) -> Optional[int]:
     """Surah number from the filename, which is how mp3quran names its files."""
     digits = "".join(c for c in source.path.stem if c.isdigit())
@@ -177,6 +187,14 @@ def cmd_segment(args: argparse.Namespace) -> int:
             failures += 1
             print(f"[{n}/{len(pending)}] FAILED {source.source_id}: "
                   f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            if _is_cuda_fatal(exc):
+                # An illegal memory access leaves the CUDA context unusable, so
+                # every source after this one would fail too.  Stopping keeps
+                # the failure to one file instead of the whole remaining run;
+                # --resume picks up from here after a restart.
+                print("\nCUDA context is unrecoverable -- stopping. Restart the "
+                      "runtime and re-run with --resume.", file=sys.stderr)
+                break
             continue
 
         manifest.append(manifest_path, records)
