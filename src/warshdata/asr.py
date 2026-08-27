@@ -71,14 +71,15 @@ class Transcriber:
     model_id: Optional[str] = None
     checkpoint: Optional[str] = None
     device: str = "cuda"
-    #: Kept small on purpose: RNNT aside, decoding cost scales with the longest
-    #: clip in the batch, and a batch of long segments is what pushes a 15 GB
-    #: card over.
+    #: Decoding cost scales with the longest clip in a batch, so clips are
+    #: length-sorted before batching and the batch is kept modest.  Note this is
+    #: about wasted work, not memory: the card sat at under 2 GB of 15 GB
+    #: throughout, with zero allocator retries.
     batch_size: int = 8
     #: The published model was trained with min_duration 0.5 / max_duration 30.
-    #: Handing the RNNT decoder a clip outside that range crashes it with an
-    #: illegal memory access, which then poisons the CUDA context for good, so
-    #: the range is enforced here rather than discovered at hour two.
+    #: Clips outside that range are not sent at all -- whether or not they were
+    #: ever the cause of a crash, feeding a decoder input it was not trained for
+    #: is not worth the risk on a run measured in hours.
     min_seconds: float = 0.5
     max_seconds: float = 30.0
     #: Which head of the hybrid model decodes.  RNNT scores better; CTC is the
@@ -107,6 +108,7 @@ class Transcriber:
             except Exception as exc:      # not a hybrid model, or older NeMo
                 print(f"could not select the {self.decoder} decoder ({exc}); "
                       f"using the model default")
+        self._disable_cuda_graphs()
 
         self._torch = torch
 
@@ -148,7 +150,6 @@ class Transcriber:
             chunk = order[start:start + self.batch_size]
             for slot, text in zip(chunk, self._run([usable[i] for i in chunk])):
                 texts_by_slot[slot] = text
-            self._free()
 
         out = [""] * len(waves)
         for position, text in zip(positions, texts_by_slot):
@@ -176,16 +177,38 @@ class Transcriber:
         except Exception as exc:
             return f"(no memory summary available: {exc})"
 
-    def _free(self) -> None:
-        """Release cached blocks between batches.
+    def _disable_cuda_graphs(self) -> None:
+        """Stop the RNNT decoder replaying captured CUDA graphs.
 
-        Two models sit on the card at once here -- the segmenter and this one --
-        so the allocator has less room to work with than either expects.
+        A graph binds a fixed sequence of kernel launches to fixed addresses and
+        replays them.  Anything that moves that memory afterwards turns the
+        replay into an out-of-bounds read -- an illegal memory access with the
+        card almost empty, which is exactly the failure seen here: rare,
+        non-deterministic, a hundred sources in, and never reproducible on the
+        file it was blamed on.
+
+        Decoding is a little slower without them.  That is worth paying for a
+        run measured in hours that has to survive to the end.
         """
-        try:
-            self._torch.cuda.empty_cache()
-        except Exception:
-            pass
+        for holder in ("decoding", "cur_decoder"):
+            decoding = getattr(self.model, holder, None)
+            config = getattr(decoding, "cfg", None)
+            greedy = getattr(config, "greedy", None) if config is not None else None
+            if greedy is not None and hasattr(greedy, "allow_cuda_graphs"):
+                try:
+                    greedy.allow_cuda_graphs = False
+                except Exception:
+                    pass
+
+        # The flag also lives on the decoding object once it is built.
+        for name in ("decoding", "cur_decoder"):
+            decoding = getattr(self.model, name, None)
+            inner = getattr(decoding, "decoding", None)
+            if inner is not None and hasattr(inner, "allow_cuda_graphs"):
+                try:
+                    inner.allow_cuda_graphs = False
+                except Exception:
+                    pass
 
     def _run(self, waves: Sequence[np.ndarray]) -> List[str]:
         try:

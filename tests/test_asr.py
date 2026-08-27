@@ -107,3 +107,52 @@ def test_memory_probe_survives_a_missing_cuda():
     probe.device = "cuda"
     assert probe.memory().allocated == 0.0
     assert "no memory summary" in probe.memory_summary()
+
+
+def test_cuda_graphs_are_switched_off():
+    """A CUDA graph replays kernel launches bound to fixed addresses. Anything
+    that moves that memory turns the replay into an out-of-bounds read -- an
+    illegal memory access on a nearly empty card, which is the failure this
+    pipeline kept hitting a hundred sources into a run."""
+    class Greedy:
+        allow_cuda_graphs = True
+
+    class Cfg:
+        greedy = Greedy()
+
+    class Decoding:
+        cfg = Cfg()
+
+        class decoding:
+            allow_cuda_graphs = True
+
+    class Model:
+        decoding = Decoding()
+
+    probe = Fake()
+    probe.model = Model()
+    Transcriber._disable_cuda_graphs(probe)
+
+    assert Model.decoding.cfg.greedy.allow_cuda_graphs is False
+    assert Model.decoding.decoding.allow_cuda_graphs is False
+
+
+def test_disabling_graphs_survives_a_model_without_them():
+    class Bare:
+        pass
+
+    probe = Fake()
+    probe.model = Bare()
+    Transcriber._disable_cuda_graphs(probe)      # must not raise
+
+
+def test_the_allocator_is_left_alone_between_batches():
+    """empty_cache() between batches was added for a fragmentation problem the
+    allocator dump later disproved, and releasing memory mid-run is exactly what
+    breaks a captured CUDA graph. It should be gone."""
+    import inspect
+
+    from warshdata import asr
+
+    source = inspect.getsource(asr)
+    assert "empty_cache" not in source
