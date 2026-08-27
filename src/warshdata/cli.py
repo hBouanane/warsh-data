@@ -8,9 +8,17 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 from . import __version__, manifest
+from .align import align_surah
 from .sources import discover
+
+
+def _surah_of(source) -> Optional[int]:
+    """Surah number from the filename, which is how mp3quran names its files."""
+    digits = "".join(c for c in source.path.stem if c.isdigit())
+    return int(digits) if digits else None
 
 # ``segment`` pulls in torch and transformers.  It is imported inside the segment
 # command so that ``stats``, ``--dry-run`` and ``--help`` work on a machine with
@@ -90,6 +98,22 @@ def cmd_segment(args: argparse.Namespace) -> int:
     )
     segmenter = Segmenter(params)
 
+    transcriber = None
+    if args.asr:
+        from .asr import Transcriber
+
+        transcriber = Transcriber(model_id=args.asr, checkpoint=args.asr_checkpoint,
+                                  device=args.device, batch_size=args.asr_batch_size)
+    reference = None
+    if args.align:
+        if transcriber is None:
+            print("--align needs --asr: there is nothing to align without transcripts",
+                  file=sys.stderr)
+            return 1
+        from . import quran as quran_text
+
+        reference = quran_text.load(args.quran_text)
+
     settings = {
         "model_id": MODEL_ID,
         "warsh_data_version": __version__,
@@ -106,6 +130,36 @@ def cmd_segment(args: argparse.Namespace) -> int:
             records, wave = segmenter.segment(source, clips_dir=clips_dir)
             if not records:
                 raise RuntimeError("no speech intervals found")
+
+            if transcriber is not None:
+                surah_number = _surah_of(source)
+                clips = [wave[r.start_sample : r.end_sample].numpy() for r in records]
+                transcripts = transcriber.transcribe(clips)
+                for record, transcript in zip(records, transcripts):
+                    record.asr = transcript
+                    record.surah_number = surah_number
+
+                if reference is not None and surah_number in reference:
+                    surah = reference[surah_number]
+                    result = align_surah(surah, transcripts)
+                    for record, spot in zip(records, result.segments):
+                        # The label is the reference text, never the transcript:
+                        # that is what keeps recognition errors out of the data.
+                        record.label = spot.label or None
+                        record.ref_start = spot.ref_start if spot.ref_start >= 0 else None
+                        record.ref_end = spot.ref_end if spot.ref_end >= 0 else None
+                        record.ayah_start = spot.verses[0] if spot.verses else None
+                        record.ayah_end = spot.verses[-1] if spot.verses else None
+                        record.align_distance = round(spot.distance, 4)
+                        record.align_ok = spot.ok
+                        record.is_formula = spot.formula
+                        record.is_repeat = spot.repeat
+                    good = sum(1 for r in records if r.align_ok)
+                    print(f"      aligned {good}/{len(records)} "
+                          f"(mean distance {result.distance:.3f})")
+                elif reference is not None:
+                    print(f"      no surah number in {source.source_id}; not aligned",
+                          file=sys.stderr)
 
             if store is not None:
                 # One source, one commit: the parquet and the mp3 that produced
@@ -436,6 +490,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pad-duration-ms", type=int, default=40)
     p.add_argument("--max-duration-ms", type=int, default=19995)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--asr", nargs="?", const="mohammed/fastconformer-quran-ar",
+                   metavar="MODEL_ID",
+                   help="transcribe each segment with this NeMo model; bare --asr "
+                        "uses mohammed/fastconformer-quran-ar")
+    p.add_argument("--asr-checkpoint", default=None,
+                   help="checkpoint file inside the model repo")
+    p.add_argument("--asr-batch-size", type=int, default=16)
+    p.add_argument("--align", action="store_true",
+                   help="align the transcripts to the Warsh text and label each segment")
+    p.add_argument("--quran-text", default=None, help="path to the Warsh JSON")
     p.add_argument("--push-to", metavar="REPO_ID", help="stream shards to this HF dataset repo as they fill")
     p.add_argument("--private", action="store_true", help="create the HF dataset repo private")
     p.add_argument("--no-raw", action="store_true", help="do not upload the source mp3s")

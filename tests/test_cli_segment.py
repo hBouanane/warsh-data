@@ -344,3 +344,77 @@ def test_dry_run_never_touches_the_hub(fake_segment_module, fake_hub, tmp_path):
 
     run(["segment", str(audio), "-o", str(out), "--push-to", "u/r", "--dry-run"])
     assert fake_hub.instances == []
+
+
+class FakeTranscriber:
+    """Stands in for the NeMo model: returns the reference text of each clip."""
+
+    made: list["FakeTranscriber"] = []
+    texts: list[str] = []
+
+    def __init__(self, model_id=None, checkpoint=None, device=None, batch_size=None):
+        self.model_id = model_id
+        self.calls = 0
+        FakeTranscriber.made.append(self)
+
+    def transcribe(self, waves):
+        self.calls += 1
+        return [FakeTranscriber.texts[i % len(FakeTranscriber.texts)]
+                for i in range(len(waves))]
+
+
+@pytest.fixture
+def fake_asr(monkeypatch):
+    import warshdata.asr as asr
+
+    FakeTranscriber.made = []
+    monkeypatch.setattr(asr, "Transcriber", FakeTranscriber)
+    return FakeTranscriber
+
+
+def test_asr_fills_the_transcript_column(fake_segment_module, fake_asr, tmp_path):
+    fake_asr.texts = ["الحمد لله رب العلمين"]
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--asr"])
+
+    records = list(manifest.read(out / "segments.jsonl"))
+    assert records, "nothing written"
+    assert all(r["asr"] == "الحمد لله رب العلمين" for r in records)
+    assert all(r["surah_number"] == 1 for r in records)
+    assert fake_asr.made[0].model_id == "mohammed/fastconformer-quran-ar"
+
+
+def test_align_without_asr_is_refused(fake_segment_module, tmp_path):
+    audio = make_audio_tree(tmp_path / "audio", surahs=(1,))
+    assert run(["segment", str(audio), "-o", str(tmp_path / "out"),
+                "--no-clips", "--align"]) == 1
+
+
+def test_align_labels_from_the_reference_not_the_asr(fake_segment_module, fake_asr, tmp_path):
+    """The point of the whole pipeline: a recognition error must not reach the
+    label. The transcript here is misspelled; the label must not be."""
+    pytest.importorskip("rapidfuzz")
+    pytest.importorskip("warshlab")
+    from warshdata import quran
+
+    try:
+        surah = quran.load()[112]
+    except FileNotFoundError:
+        pytest.skip("Warsh text not downloaded")
+
+    # A mangled version of the opening words.
+    fake_asr.texts = [surah.rasm(0, 4).replace("قل", "قد")]
+    audio = make_audio_tree(tmp_path / "audio", surahs=(112,))
+    out = tmp_path / "out"
+
+    run(["segment", str(audio), "-o", str(out), "--no-clips", "--asr", "--align"])
+
+    records = list(manifest.read(out / "segments.jsonl"))
+    labelled = [r for r in records if r["label"]]
+    assert labelled, "alignment produced no labels"
+    for record in labelled:
+        assert "قد" not in record["label"], "the ASR's error leaked into the label"
+        assert record["ayah_start"] is not None
+        assert record["align_distance"] is not None

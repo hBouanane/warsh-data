@@ -37,6 +37,21 @@ class SegmentRecord:
     source_is_complete: bool = True
     is_last_of_source: bool = False
 
+    #: Filled in by the transcribe + align pass.  ``asr`` is the recogniser's
+    #: guess and is kept for diagnosis only; ``label`` is the reference text the
+    #: aligner selected, which is what a model should be trained on.
+    surah_number: Optional[int] = None
+    asr: Optional[str] = None
+    label: Optional[str] = None
+    ref_start: Optional[int] = None
+    ref_end: Optional[int] = None
+    ayah_start: Optional[int] = None
+    ayah_end: Optional[int] = None
+    align_distance: Optional[float] = None
+    align_ok: Optional[bool] = None
+    is_formula: bool = False
+    is_repeat: bool = False
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
 

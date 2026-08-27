@@ -175,6 +175,35 @@ Outputs:
 - `out/segment_params.json` — the settings the manifest was produced with
 - `out/segments/<reciter>/clips/<segment_id>.wav` — 16 kHz mono clips
 
+## Transcribe and label in the same pass
+
+```bash
+warsh-data segment ./audio -o ./out --asr --align --push-to <user>/warsh-v3 --resume
+```
+
+`--asr` transcribes every segment with
+[mohammed/fastconformer-quran-ar](https://huggingface.co/mohammed/fastconformer-quran-ar);
+`--align` places those transcripts in the Warsh text and writes the reference
+span as the label.
+
+Done in one pass on purpose. Each source becomes one parquet named after it, so
+adding text afterwards would mean rewriting all 1495 files -- exactly the
+operation the layout exists to avoid. Segment, transcribe and align together and
+each row is written once, complete.
+
+**The transcript is not the label.** `asr` is kept for diagnosis; `label` is the
+reference text the aligner selected. A recognition error changes where a segment
+is placed, not what it is labelled with, so the errors are discarded rather than
+trained on. That is also why a Hafs-trained recogniser is usable against Warsh
+audio here -- it only has to be close enough to locate.
+
+Columns added: `asr`, `label`, `ref_start`, `ref_end`, `ayah_start`, `ayah_end`,
+`align_distance`, `align_ok`, `is_formula`, `is_repeat`.
+
+`align_distance` is what to filter on afterwards: it is how far the transcript
+sits from the text it was matched to, so the segments worth dropping sort to the
+top.
+
 ## Push to the Hub
 
 ```bash
