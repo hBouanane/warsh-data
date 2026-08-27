@@ -71,6 +71,17 @@ CLOSING = (
     "صدق الله العظيم",
 )
 
+#: Pointed text for each formula, so a formula segment carries a usable label
+#: rather than a null.  These are real speech with known words; there is no
+#: reason to discard them.  The basmala is taken from verse 1:1 of the loaded
+#: Warsh text rather than written here, so it matches that orthography exactly.
+#: The isti'adha and the closing are not Quranic text, so they are given in the
+#: ordinary pointed form.
+ISTIADHA_LABEL = "أَعُوذُ بِاللَّهِ مِنَ الشَّيْطَانِ الرَّجِيمِ"
+#: Fallback when Al-Fatiha is not the surah being aligned.
+BASMALA_LABEL = "بِسْمِ اِ۬للَّهِ اِ۬لرَّحْمَٰنِ اِ۬لرَّحِيمِ"
+CLOSING_LABEL = "صَدَقَ اللَّهُ الْعَظِيمُ"
+
 #: Cost of dropping a word from either sequence.  Substitutions are scored on a
 #: 0..1 scale, so a gap at 1.0 is never cheaper than even the worst substitution
 #: -- which keeps the alignment from silently skipping material.
@@ -549,6 +560,38 @@ def align_words(ref: Sequence[str], hyp: Sequence[str],
     return mapping, len(anchors)
 
 
+def _formula_label(transcript: str, surah, normalizer) -> str:
+    """Pointed text for whichever formula this segment is.
+
+    The basmala comes from verse 1:1 of the loaded text so it carries the same
+    orthography as every other label; the other two are not Quranic and are
+    written out.  Picking by closest match rather than by position, because a
+    reciter may say the isti'adha, the basmala, both, or neither.
+    """
+    spoken = " ".join(normalizer(transcript))
+    if not spoken:
+        return ""
+
+    candidates = [(f, ISTIADHA_LABEL) for f in ISTIADHA]
+    candidates.append((BASMALA, surah_basmala(surah)))
+    candidates.extend((f, CLOSING_LABEL) for f in CLOSING)
+
+    best_label, best_score = "", 1.0
+    for plain, pointed in candidates:
+        score = _distance(spoken, " ".join(normalizer(plain)))
+        if score < best_score:
+            best_label, best_score = pointed, score
+    return best_label
+
+
+def surah_basmala(surah) -> str:
+    """The basmala as this text spells it -- verse 1:1 in Al-Fatiha."""
+    if surah.number == 1 and surah.verses:
+        first = surah.verses[0]
+        return surah.label(first.word_start, first.word_end)
+    return BASMALA_LABEL
+
+
 def align_surah(
     surah,
     transcripts: Sequence[str],
@@ -627,7 +670,8 @@ def align_surah(
             is_formula = index in formula_segments
             if not is_formula:
                 unaligned.append(index)
-            results.append(Aligned(index=index, ref_start=-1, ref_end=-1, label="",
+            label = _formula_label(transcript, surah, normalizer) if is_formula else ""
+            results.append(Aligned(index=index, ref_start=-1, ref_end=-1, label=label,
                                    rasm="", verses=[], distance=0.0 if is_formula else 1.0,
                                    ok=is_formula, hypothesis=transcript,
                                    formula=is_formula))

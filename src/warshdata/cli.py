@@ -76,7 +76,17 @@ def cmd_segment(args: argparse.Namespace) -> int:
         if store is not None and args.resume:
             # The published files are the authority on what is done.  The path
             # encodes the source, so this is a listing, not a download.
-            already |= store.done_sources()
+            published = store.done_sources()
+            if args.recheck_asr:
+                # A source published before transcription existed looks finished
+                # by filename alone.  This reads one column per published file to
+                # find those, which costs a request each -- hence opt-in.
+                print(f"Checking {len(published)} published source(s) for transcripts ...")
+                stale = store.sources_missing_column("asr")
+                if stale:
+                    print(f"  {len(stale)} published without transcripts; redoing them")
+                published -= stale
+            already |= published
         pending = [s for s in sources if s.source_id not in already]
 
     if args.limit:
@@ -517,6 +527,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--asr-batch-size", type=int, default=16)
     p.add_argument("--align", action="store_true",
                    help="align the transcripts to the Warsh text and label each segment")
+    p.add_argument("--recheck-asr", action="store_true",
+                   help="with --resume, also redo sources published without transcripts "
+                        "(reads one column per published file, so it is not free)")
     p.add_argument("--quran-text", default=None, help="path to the Warsh JSON")
     p.add_argument("--push-to", metavar="REPO_ID", help="stream shards to this HF dataset repo as they fill")
     p.add_argument("--private", action="store_true", help="create the HF dataset repo private")

@@ -73,10 +73,12 @@ class Transcriber:
     def transcribe(self, waves: Sequence[np.ndarray]) -> List[str]:
         """One transcript per waveform, in order.
 
-        Clips too short to transcribe come back empty; clips longer than the
-        model's training range are truncated for recognition only.  The full
-        audio still reaches the dataset -- a shortened transcript is enough to
-        locate the segment, and the label comes from the reference text anyway.
+        Clips outside the model's training range come back empty rather than
+        truncated or forced through: too long crashes the RNNT decoder, and a
+        truncated transcript would place a span shorter than the audio it was
+        cut from.  They keep their audio in the dataset with no transcript and
+        no label, so they are easy to find and redo once there is a way to
+        handle them.
         """
         if not waves:
             return []
@@ -87,9 +89,9 @@ class Transcriber:
         usable, positions = [], []
         for index, wave in enumerate(waves):
             array = np.asarray(wave, dtype=np.float32).reshape(-1)
-            if array.size < floor:
+            if array.size < floor or array.size > ceiling:
                 continue
-            usable.append(array[:ceiling] if array.size > ceiling else array)
+            usable.append(array)
             positions.append(index)
 
         if not usable:

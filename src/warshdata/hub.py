@@ -195,6 +195,39 @@ class HubStore:
                 out.add(source_id)
         return out
 
+    def sources_missing_column(self, column: str, workers: int = 8) -> Set[str]:
+        """Published sources whose ``column`` is empty for every row.
+
+        Reads that one column from each published parquet, which is a few KB per
+        file rather than the whole thing.  Needed because a source published by
+        an earlier run without transcription looks finished by filename alone,
+        and would be skipped for ever.
+        """
+        import concurrent.futures as futures
+
+        import pyarrow.parquet as pq
+        from huggingface_hub import HfFileSystem
+
+        fs = HfFileSystem(token=self.token)
+        paths = [p for p in self.repo_files() if source_id_from_shard_path(p)]
+
+        def check(path: str) -> Optional[str]:
+            try:
+                with fs.open(f"datasets/{self.repo_id}/{path}", "rb") as handle:
+                    parquet = pq.ParquetFile(handle)
+                    if column not in parquet.schema_arrow.names:
+                        return source_id_from_shard_path(path)
+                    values = parquet.read(columns=[column]).column(column).to_pylist()
+            except Exception:
+                return None          # unreadable: leave it alone rather than redo it
+            if any(v for v in values):
+                return None
+            return source_id_from_shard_path(path)
+
+        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            found = list(pool.map(check, paths))
+        return {s for s in found if s}
+
     def _ensure_readme(self) -> None:
         if "README.md" in self.repo_files():
             return
