@@ -199,13 +199,13 @@ class HubStore:
         """Published sources whose ``column`` is empty for every row.
 
         Reads that one column from each published parquet, which is a few KB per
-        file rather than the whole thing.  Needed because a source published by
+        file rather than the whole thing -- see :func:`_open_projected` for why
+        that takes two non-default settings to actually be true.  Needed because a source published by
         an earlier run without transcription looks finished by filename alone,
         and would be skipped for ever.
         """
         import concurrent.futures as futures
 
-        import pyarrow.parquet as pq
         from huggingface_hub import HfFileSystem
 
         fs = HfFileSystem(token=self.token)
@@ -213,11 +213,10 @@ class HubStore:
 
         def check(path: str) -> Optional[str]:
             try:
-                with fs.open(f"datasets/{self.repo_id}/{path}", "rb") as handle:
-                    parquet = pq.ParquetFile(handle)
-                    if column not in parquet.schema_arrow.names:
-                        return source_id_from_shard_path(path)
-                    values = parquet.read(columns=[column]).column(column).to_pylist()
+                parquet = _open_projected(fs, f"datasets/{self.repo_id}/{path}")
+                if column not in parquet.schema_arrow.names:
+                    return source_id_from_shard_path(path)
+                values = parquet.read(columns=[column]).column(column).to_pylist()
             except Exception:
                 return None          # unreadable: leave it alone rather than redo it
             if any(v for v in values):
@@ -294,20 +293,61 @@ class HubStore:
         )
 
 
-def read_rows(repo_id: str, token: Optional[str] = None) -> Iterator[Dict[str, Any]]:
-    """Yield every segment row from a repo's shards, without the audio.
+def _open_projected(fs, path: str):
+    """Open a shard so that reading a few columns costs a few columns.
 
-    Parquet is columnar, so the audio column is never transferred -- this reads
-    a corpus-sized manifest for a few MB.
+    Two settings, both needed, and neither is the default:
+
+    ``cache_type="none"`` stops fsspec filling a read-ahead block around every
+    range pyarrow asks for.  With the default cacher those blocks cover the
+    audio column and the whole 16 MB file comes down to produce 50 KB of text.
+
+    ``pre_buffer=True`` then coalesces pyarrow's scattered reads -- footer,
+    then each column chunk -- into a handful of requests.  Without it, an
+    uncached file issues every small read separately, and against a remote with
+    per-request auth and a CDN redirect that is slower than downloading the
+    whole thing: 27s versus 7s on a 16 MB shard.
+
+    Together: 1.8s and a quarter of a megabyte.
     """
     import pyarrow.parquet as pq
+
+    return pq.ParquetFile(fs.open(path, "rb", cache_type="none"), pre_buffer=True)
+
+
+def _read_shard(fs, path: str) -> List[Dict[str, Any]]:
+    """Every row of one shard, minus the audio column."""
+    parquet = _open_projected(fs, path)
+    columns = [name for name in parquet.schema_arrow.names if name != "audio"]
+    return parquet.read(columns=columns).to_pylist()
+
+
+def read_rows(repo_id: str, token: Optional[str] = None,
+              workers: int = 16) -> Iterator[Dict[str, Any]]:
+    """Yield every segment row from a repo's shards, without the audio.
+
+    Parquet is columnar, so the audio column is not transferred -- though that
+    takes explicit settings to be true over a remote filesystem, which is what
+    :func:`_open_projected` is for.
+
+    What is left is latency: a shard costs a couple of seconds in round trips
+    however little of it is read, and a full corpus is ~1500 shards.  The
+    reads are independent, so they run on a small thread pool; shards are still
+    yielded in path order, so the manifest does not depend on scheduling.
+    """
+    import concurrent.futures as futures
+
     from huggingface_hub import HfFileSystem
 
     fs = HfFileSystem(token=token)
-    for path in sorted(fs.glob(f"datasets/{repo_id}/data/*/*.parquet")):
-        with fs.open(path, "rb") as handle:
-            parquet = pq.ParquetFile(handle)
-            columns = [name for name in parquet.schema_arrow.names if name != "audio"]
-            table = parquet.read(columns=columns)
-        for row in table.to_pylist():
-            yield row
+    paths = sorted(fs.glob(f"datasets/{repo_id}/data/*/*.parquet"))
+
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        # Submitted in slices rather than all at once: a whole corpus of
+        # in-flight results would hold every row in memory before the first is
+        # consumed, which defeats the point of an iterator.
+        for start in range(0, len(paths), workers * 4):
+            batch = paths[start:start + workers * 4]
+            for rows in pool.map(lambda p: _read_shard(fs, p), batch):
+                for row in rows:
+                    yield row

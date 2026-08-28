@@ -14,6 +14,7 @@ import pytest
 import soundfile as sf
 from conftest import make_record, make_wave
 
+from warshdata import hub
 from warshdata.hub import (
     HubStore,
     build_parquet,
@@ -195,3 +196,59 @@ def test_upload_params(fake_api, tmp_path):
     store = HubStore(repo_id="u/r", work_dir=tmp_path)
     store.upload_params({"model_id": "obadx/recitation-segmenter-v2", "batch_size": 16})
     assert "segment_params.json" in fake_api.uploads
+
+
+def test_read_rows_keeps_shard_order_while_reading_in_parallel(monkeypatch):
+    """Shards are read on a thread pool, so the order rows arrive in is a
+    scheduling accident unless it is imposed. A manifest whose row order shifted
+    run to run would make two manifests of the same corpus impossible to diff.
+    """
+    import random
+    import time
+
+    paths = [f"datasets/r/data/rec{i:02d}/001.parquet" for i in range(40)]
+    random.Random(0).shuffle(paths)   # glob order is not sorted order
+
+    class FakeFS:
+        def __init__(self, *a, **k):
+            pass
+
+        def glob(self, pattern):
+            return list(paths)
+
+    def fake_read(fs, path):
+        # Uneven latency: a serial reader cannot tell the difference, a
+        # parallel one finishes out of order unless the results are reordered.
+        time.sleep(random.Random(path).random() / 200)
+        return [{"path": path, "i": i} for i in range(3)]
+
+    monkeypatch.setattr("huggingface_hub.HfFileSystem", FakeFS)
+    monkeypatch.setattr(hub, "_read_shard", fake_read)
+
+    rows = list(hub.read_rows("r", workers=8))
+    assert len(rows) == len(paths) * 3
+    assert [r["path"] for r in rows[::3]] == sorted(paths)
+
+
+def test_shards_are_opened_without_read_ahead_and_with_coalescing(monkeypatch):
+    """Both settings are load-bearing and neither is a default, so a later
+    tidy-up that drops one silently reintroduces the bug it fixed: without
+    cache_type="none" fsspec's block cache pulls the audio column and a
+    text-only manifest downloads the entire corpus; without pre_buffer the
+    uncached reads go out one at a time and are slower than doing exactly that.
+    """
+    seen = {}
+
+    class FakeFS:
+        def open(self, path, mode, **kwargs):
+            seen.update(kwargs)
+            return io.BytesIO()
+
+    def fake_parquet_file(handle, **kwargs):
+        seen.update(kwargs)
+        return "parquet"
+
+    monkeypatch.setattr("pyarrow.parquet.ParquetFile", fake_parquet_file)
+    assert hub._open_projected(FakeFS(), "some/shard.parquet") == "parquet"
+    assert seen["cache_type"] == "none", "read-ahead would fetch the audio column"
+    assert seen["pre_buffer"] is True, "uncached reads must be coalesced"

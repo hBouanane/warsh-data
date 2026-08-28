@@ -379,6 +379,12 @@ def cmd_manifest(args: argparse.Namespace) -> int:
         for row in read_rows(args.repo):
             fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
             count += 1
+            # One rewritten line rather than a scrolling log: a corpus-sized
+            # read is long enough that silence looks like a hang, and flushing
+            # here means `wc -l` on the output tracks it.
+            if count % 2000 == 0:
+                fh.flush()
+                print(f"  {count} rows ...", end=chr(13), file=sys.stderr, flush=True)
     print(f"Wrote {count} rows to {out}")
     return 0
 
