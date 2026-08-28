@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -376,16 +377,34 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     width = 0
+    tty = sys.stderr.isatty()
+    last = 0.0
 
     def show(progress) -> None:
-        # One rewritten line rather than a scrolling log: a corpus-sized read
-        # runs for minutes, and a log that long is what made the screen tear
-        # last time.  Padded to the previous width so a shorter line does not
-        # leave the tail of the longer one behind it.
-        nonlocal width
+        """Progress the way the thing reading it can actually display it.
+
+        On a terminal, one line rewritten in place: a corpus-sized read runs
+        for minutes, and a log that long is what tore the screen last time.
+
+        A notebook cell is not a terminal.  It renders output only once a line
+        ends in a newline, so a carriage-returned line never appears at all --
+        which looks exactly like a hang, only now with the run genuinely
+        invisible.  There, print whole lines and print them rarely.
+        """
+        nonlocal width, last
         line = "  " + progress.line()
-        print(line.ljust(width), end=chr(13), file=sys.stderr, flush=True)
-        width = len(line)
+        if tty:
+            # Padded to the previous width so a shorter line does not leave
+            # the tail of the longer one behind it.
+            print(line.ljust(width), end=chr(13), file=sys.stderr, flush=True)
+            width = len(line)
+            return
+
+        now = time.monotonic()
+        done = progress.shards_done == progress.shards_total
+        if done or now - last >= 20.0:
+            last = now
+            print(line, file=sys.stderr, flush=True)
 
     print(f"Reading {args.repo} ...", file=sys.stderr)
     with out.open("w", encoding="utf-8") as fh:
@@ -396,7 +415,8 @@ def cmd_manifest(args: argparse.Namespace) -> int:
             # so an interrupted read still leaves a usable partial manifest.
             if count % 2000 == 0:
                 fh.flush()
-    print(" " * width, file=sys.stderr)
+    if tty:
+        print(" " * width, file=sys.stderr)
     print(f"Wrote {count} rows to {out}")
     return 0
 
@@ -522,6 +542,50 @@ def cmd_listen(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    """Pull the extremes of the corpus into one page and listen to them."""
+    from . import review
+
+    rows = list(manifest.read(Path(args.manifest)))
+    if not rows:
+        print(f"No rows in {args.manifest}", file=sys.stderr)
+        return 1
+
+    sections = [
+        ("Longest segments",
+         "the segmenter missed every stop inside these; past 30 s nothing was "
+         "transcribed or labelled at all",
+         review.pick(rows, "duration", args.count, largest=True)),
+        ("Shortest segments",
+         "under 0.5 s nothing was transcribed either, and a sub-second segment "
+         "is usually a breath or a click rather than speech",
+         review.pick(rows, "duration", args.count, largest=False)),
+        ("Worst aligned",
+         "either a genuinely misplaced span or a voice the recogniser struggled "
+         "with -- read the label against what you hear to tell which",
+         review.pick(rows, "distance", args.count, largest=True)),
+    ]
+
+    wanted = {r["segment_id"]: r for rows_ in sections for r in rows_[2]}
+    print(f"Fetching audio for {len(wanted)} segment(s) from {args.repo} ...")
+    clips = review.fetch_clips(args.repo, list(wanted.values()), workers=args.workers)
+
+    missing = len(wanted) - len(clips)
+    if missing:
+        print(f"warning: {missing} segment(s) had no audio", file=sys.stderr)
+
+    page = review.build_page(sections, clips, Path(args.output))
+    size = page.stat().st_size / 1e6
+    for heading, _, chosen in sections:
+        if chosen:
+            field = "duration_seconds" if "aligned" not in heading else "align_distance"
+            lo, hi = chosen[-1].get(field), chosen[0].get(field)
+            print(f"  {heading}: {len(chosen)} ({hi:.3g} down to {lo:.3g})")
+    print("")
+    print(f"Wrote {page} ({size:.1f} MB, self-contained)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -603,6 +667,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("repo", help="HF dataset repo id")
     p.add_argument("-o", "--output", default="./segments.jsonl")
     p.set_defaults(func=cmd_manifest)
+
+    p = sub.add_parser("review", help="listen to the extremes of a published corpus")
+    p.add_argument("repo", help="dataset repo the segments were published to")
+    p.add_argument("--manifest", default="full.jsonl",
+                   help="manifest to choose from (default: full.jsonl)")
+    p.add_argument("-n", "--count", type=int, default=10,
+                   help="segments per section (default: 10)")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("-o", "--output", default="out/review.html")
+    p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")
