@@ -375,16 +375,28 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    width = 0
+
+    def show(progress) -> None:
+        # One rewritten line rather than a scrolling log: a corpus-sized read
+        # runs for minutes, and a log that long is what made the screen tear
+        # last time.  Padded to the previous width so a shorter line does not
+        # leave the tail of the longer one behind it.
+        nonlocal width
+        line = "  " + progress.line()
+        print(line.ljust(width), end=chr(13), file=sys.stderr, flush=True)
+        width = len(line)
+
+    print(f"Reading {args.repo} ...", file=sys.stderr)
     with out.open("w", encoding="utf-8") as fh:
-        for row in read_rows(args.repo):
+        for row in read_rows(args.repo, on_progress=show):
             fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
             count += 1
-            # One rewritten line rather than a scrolling log: a corpus-sized
-            # read is long enough that silence looks like a hang, and flushing
-            # here means `wc -l` on the output tracks it.
+            # Flushed as it goes so `wc -l` on the output tracks the run, and
+            # so an interrupted read still leaves a usable partial manifest.
             if count % 2000 == 0:
                 fh.flush()
-                print(f"  {count} rows ...", end=chr(13), file=sys.stderr, flush=True)
+    print(" " * width, file=sys.stderr)
     print(f"Wrote {count} rows to {out}")
     return 0
 

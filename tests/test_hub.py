@@ -252,3 +252,40 @@ def test_shards_are_opened_without_read_ahead_and_with_coalescing(monkeypatch):
     assert hub._open_projected(FakeFS(), "some/shard.parquet") == "parquet"
     assert seen["cache_type"] == "none", "read-ahead would fetch the audio column"
     assert seen["pre_buffer"] is True, "uncached reads must be coalesced"
+
+
+def test_read_rows_reports_progress_per_shard(monkeypatch):
+    """A corpus-sized read is minutes of silence otherwise, which is
+    indistinguishable from a hang."""
+    paths = [f"datasets/r/data/rec{i:02d}/00{i}.parquet" for i in range(5)]
+
+    class FakeFS:
+        def __init__(self, *a, **k):
+            pass
+
+        def glob(self, pattern):
+            return list(paths)
+
+    monkeypatch.setattr("huggingface_hub.HfFileSystem", FakeFS)
+    monkeypatch.setattr(hub, "_read_shard", lambda fs, p: [{"p": p}, {"p": p}])
+
+    seen = []
+    rows = list(hub.read_rows("r", on_progress=seen.append))
+
+    assert len(rows) == 10
+    assert [p.shards_done for p in seen] == [1, 2, 3, 4, 5]
+    assert all(p.shards_total == 5 for p in seen)
+    assert [p.rows for p in seen] == [2, 4, 6, 8, 10]
+    # The source, not the full repo path, is what identifies progress usefully.
+    assert seen[0].source == "rec00/000"
+    assert seen[-1].fraction == 1.0
+    assert seen[-1].eta_seconds == 0.0
+
+
+def test_progress_line_survives_a_zero_length_read():
+    """Division by shards_done and shards_total both have to be safe: an empty
+    repo is a legitimate state, not an error."""
+    empty = hub.ReadProgress(0, 0, 0, 0.0, "")
+    assert empty.fraction == 1.0
+    assert empty.eta_seconds == 0.0
+    assert empty.line()

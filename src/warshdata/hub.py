@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
+                    Set)
 
 import numpy as np
 import soundfile as sf
@@ -46,6 +48,7 @@ __all__ = [
     "source_id_from_shard_path",
     "encode_flac",
     "read_rows",
+    "ReadProgress",
     "README",
 ]
 
@@ -95,6 +98,41 @@ boundaries, because those are expected to change.
 
 Audio source: mp3quran.net. Check their terms before redistributing.
 """
+
+
+@dataclass
+class ReadProgress:
+    """How far through the shards a :func:`read_rows` call is.
+
+    Reported per shard rather than per row: rows arrive in bursts of a whole
+    shard, so a row-counted rate reads as a series of jumps and stalls.
+    """
+
+    shards_done: int
+    shards_total: int
+    rows: int
+    elapsed: float
+    #: The source just read, as ``reciter/surah``.
+    source: str
+
+    @property
+    def fraction(self) -> float:
+        return self.shards_done / self.shards_total if self.shards_total else 1.0
+
+    @property
+    def eta_seconds(self) -> float:
+        """Remaining time at the rate so far, which is steady enough to trust:
+        shards differ in length but every one costs the same round trips."""
+        if not self.shards_done:
+            return 0.0
+        return (self.elapsed / self.shards_done) * (self.shards_total - self.shards_done)
+
+    def line(self) -> str:
+        eta = self.eta_seconds
+        clock = f"{int(eta) // 60}m{int(eta) % 60:02d}s" if eta >= 60 else f"{eta:.0f}s"
+        return (f"{self.shards_done}/{self.shards_total} sources "
+                f"({self.fraction:.0%})  {self.rows} segments  "
+                f"eta {clock}  {self.source}")
 
 
 def encode_flac(wave: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
@@ -322,8 +360,9 @@ def _read_shard(fs, path: str) -> List[Dict[str, Any]]:
     return parquet.read(columns=columns).to_pylist()
 
 
-def read_rows(repo_id: str, token: Optional[str] = None,
-              workers: int = 16) -> Iterator[Dict[str, Any]]:
+def read_rows(repo_id: str, token: Optional[str] = None, workers: int = 16,
+              on_progress: Optional[Callable[["ReadProgress"], None]] = None
+              ) -> Iterator[Dict[str, Any]]:
     """Yield every segment row from a repo's shards, without the audio.
 
     Parquet is columnar, so the audio column is not transferred -- though that
@@ -334,6 +373,10 @@ def read_rows(repo_id: str, token: Optional[str] = None,
     however little of it is read, and a full corpus is ~1500 shards.  The
     reads are independent, so they run on a small thread pool; shards are still
     yielded in path order, so the manifest does not depend on scheduling.
+
+    ``on_progress`` is called once per shard with a :class:`ReadProgress`.  The
+    shard total is known before the first read, so a caller can show real
+    progress rather than a rising count with no end in sight.
     """
     import concurrent.futures as futures
 
@@ -342,12 +385,24 @@ def read_rows(repo_id: str, token: Optional[str] = None,
     fs = HfFileSystem(token=token)
     paths = sorted(fs.glob(f"datasets/{repo_id}/data/*/*.parquet"))
 
+    started = time.time()
+    done = rows_seen = 0
+
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
         # Submitted in slices rather than all at once: a whole corpus of
         # in-flight results would hold every row in memory before the first is
         # consumed, which defeats the point of an iterator.
         for start in range(0, len(paths), workers * 4):
             batch = paths[start:start + workers * 4]
-            for rows in pool.map(lambda p: _read_shard(fs, p), batch):
+            for path, rows in zip(batch, pool.map(lambda p: _read_shard(fs, p), batch)):
+                done += 1
+                rows_seen += len(rows)
+                if on_progress is not None:
+                    on_progress(ReadProgress(
+                        shards_done=done, shards_total=len(paths), rows=rows_seen,
+                        elapsed=time.time() - started,
+                        source=source_id_from_shard_path(
+                            path.split(f"{repo_id}/", 1)[-1]) or path,
+                    ))
                 for row in rows:
                     yield row
