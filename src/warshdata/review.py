@@ -25,7 +25,7 @@ import html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-__all__ = ["pick", "fetch_clips", "build_page"]
+__all__ = ["pick", "unlabelled", "fetch_clips", "build_page"]
 
 FIELDS = {"duration": "duration_seconds", "distance": "align_distance"}
 
@@ -43,6 +43,19 @@ def pick(rows: Sequence[Dict[str, Any]], by: str, n: int,
     scored = [r for r in rows if r.get(field) is not None]
     scored.sort(key=lambda r: r[field], reverse=largest)
     return scored[:n]
+
+
+def unlabelled(rows, n: int):
+    """``n`` rows carrying no label, longest first.
+
+    These are not a tail of the distance distribution -- they have no distance
+    worth reading, because nothing was transcribed to compare against. Longest
+    first because duration is why most of them exist: past the recogniser's
+    window a clip is skipped outright.
+    """
+    missing = [r for r in rows if not r.get("label")]
+    missing.sort(key=lambda r: -(r.get("duration_seconds") or 0))
+    return missing[:n]
 
 
 def fetch_clips(repo_id: str, rows: Sequence[Dict[str, Any]],

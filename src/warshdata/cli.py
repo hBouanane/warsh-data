@@ -564,6 +564,10 @@ def cmd_review(args: argparse.Namespace) -> int:
          "either a genuinely misplaced span or a voice the recogniser struggled "
          "with -- read the label against what you hear to tell which",
          review.pick(rows, "distance", args.count, largest=True)),
+        ("No label at all",
+         "nothing was transcribed, so nothing could be aligned -- almost always "
+         "a clip past the 30 s window, i.e. a missed waqf",
+         review.unlabelled(rows, args.count)),
     ]
 
     wanted = {r["segment_id"]: r for rows_ in sections for r in rows_[2]}

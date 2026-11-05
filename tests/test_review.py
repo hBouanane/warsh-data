@@ -160,3 +160,16 @@ def test_an_unreadable_shard_does_not_sink_the_run(monkeypatch, capsys):
     clips = review.fetch_clips("some/repo", [{"segment_id": "a", "source_id": "r/1"}])
     assert clips == {}
     assert "could not read" in capsys.readouterr().out
+
+
+def test_unlabelled_picks_missing_labels_longest_first():
+    """Their own section, not the distance tail: with no transcript there is
+    nothing to compare the label against, so the stored distance means nothing.
+    Longest first because duration is why most of them exist."""
+    rows = [row("ok", 5.0, 0.01),
+            row("long", 44.0, 1.0, asr=None, label=None),
+            row("mid", 31.0, 1.0, asr=None, label=None),
+            row("empty-label", 12.0, 0.5, label="")]
+    got = review.unlabelled(rows, 10)
+    assert [r["segment_id"] for r in got] == ["long", "mid", "empty-label"]
+    assert review.unlabelled([row("ok", 5.0)], 10) == []
