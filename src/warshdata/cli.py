@@ -586,6 +586,50 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quality(args: argparse.Namespace) -> int:
+    """Per-reciter label fit and waqf fit, as two separate tables."""
+    from .quality import (format_label_table, format_waqf_table, label_fit,
+                          verdicts, waqf_fit)
+
+    rows = list(manifest.read(Path(args.manifest)))
+    if not rows:
+        print(f"No rows in {args.manifest}", file=sys.stderr)
+        return 1
+
+    labels = label_fit(rows)
+    waqf = waqf_fit(rows)
+
+    print(f"{len(rows)} segments, {len(labels)} reciter(s)")
+    print("")
+    print("How far the label sits from what the recogniser heard")
+    print("  distance is normalised Levenshtein on skeletons -- consonants only,")
+    print("  diacritics stripped on both sides, so it says nothing about those")
+    print("")
+    print(format_label_table(labels))
+    print("")
+    print("  scored = segments with both a transcript and a distance; the rest")
+    print("           are excluded above, since an empty transcript scores 1.0")
+    print("           against a real span and is an absent measurement, not a bad one")
+    print("  short  = label holds 2+ more words than the transcript")
+    print("  notx   = never transcribed (clip outside the 0.5-30 s window)")
+    print("  nolab  = no label at all")
+    print("")
+    print("")
+    print("Whether the segmenter is finding each reciter's stops")
+    print("  holes = segments past 30 s that got no transcript and no label")
+    print("")
+    print(format_waqf_table(waqf))
+
+    notes = verdicts(labels, waqf)
+    if notes:
+        print("")
+        print("")
+        print("Worth acting on:")
+        for note in notes:
+            print(f"  {note}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warsh-data", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -677,6 +721,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("-o", "--output", default="out/review.html")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("quality", help="per-reciter label fit and waqf fit")
+    p.add_argument("manifest", nargs="?", default="full.jsonl",
+                   help="manifest to read (default: full.jsonl)")
+    p.set_defaults(func=cmd_quality)
 
     p = sub.add_parser("stats", help="summarise a segments manifest")
     p.add_argument("manifest", help="path to segments.jsonl")
