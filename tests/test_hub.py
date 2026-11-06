@@ -289,3 +289,26 @@ def test_progress_line_survives_a_zero_length_read():
     assert empty.fraction == 1.0
     assert empty.eta_seconds == 0.0
     assert empty.line()
+
+
+def test_read_rows_announces_the_shard_count_before_reading(monkeypatch):
+    """Listing takes seconds of its own, and longer unauthenticated. Without
+    this the caller has nothing to print until the first shard lands, which
+    reads as a hang before any work has visibly started."""
+    order = []
+    paths = [f"datasets/r/data/rec{i}/001.parquet" for i in range(4)]
+
+    class FakeFS:
+        def __init__(self, *a, **k):
+            pass
+
+        def glob(self, pattern):
+            return list(paths)
+
+    monkeypatch.setattr("huggingface_hub.HfFileSystem", FakeFS)
+    monkeypatch.setattr(hub, "_read_shard",
+                        lambda fs, p: (order.append(("read", p)), [{"p": p}])[1])
+
+    list(hub.read_rows("r", on_listed=lambda n: order.append(("listed", n))))
+
+    assert order[0] == ("listed", 4), f"count must precede any read: {order[:2]}"

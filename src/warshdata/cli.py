@@ -376,47 +376,43 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    width = 0
-    tty = sys.stderr.isatty()
     last = 0.0
 
     def show(progress) -> None:
-        """Progress the way the thing reading it can actually display it.
+        """Whole lines, at intervals -- never a rewritten one.
 
-        On a terminal, one line rewritten in place: a corpus-sized read runs
-        for minutes, and a log that long is what tore the screen last time.
+        Rewriting a line in place needs a terminal that honours a carriage
+        return, and the thing most likely to be reading this is a notebook
+        cell, which renders output only when a line ends in a newline.  It
+        cannot be detected either: Colab runs ``!`` commands under a pseudo-
+        terminal, so ``isatty()`` says yes and the rewritten line vanishes --
+        a run that looks hung for its whole duration, which is exactly what
+        the first two attempts at this did.
 
-        A notebook cell is not a terminal.  It renders output only once a line
-        ends in a newline, so a carriage-returned line never appears at all --
-        which looks exactly like a hang, only now with the run genuinely
-        invisible.  There, print whole lines and print them rarely.
+        A line every interval is ~60 lines across a corpus-sized read.  That
+        is a log short enough not to tear the screen and long enough to prove
+        the thing is alive.
         """
-        nonlocal width, last
-        line = "  " + progress.line()
-        if tty:
-            # Padded to the previous width so a shorter line does not leave
-            # the tail of the longer one behind it.
-            print(line.ljust(width), end=chr(13), file=sys.stderr, flush=True)
-            width = len(line)
-            return
-
+        nonlocal last
         now = time.monotonic()
-        done = progress.shards_done == progress.shards_total
-        if done or now - last >= 20.0:
+        final = progress.shards_done == progress.shards_total
+        if progress.shards_done == 1 or final or now - last >= args.every:
             last = now
-            print(line, file=sys.stderr, flush=True)
+            print("  " + progress.line(), file=sys.stderr, flush=True)
 
     print(f"Reading {args.repo} ...", file=sys.stderr)
+    print("  listing shards ...", file=sys.stderr, flush=True)
     with out.open("w", encoding="utf-8") as fh:
-        for row in read_rows(args.repo, on_progress=show):
+        for row in read_rows(args.repo, workers=args.workers, on_progress=show,
+                             on_listed=lambda n: print(
+                                 f"  {n} sources to read", file=sys.stderr,
+                                 flush=True)):
             fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
             count += 1
             # Flushed as it goes so `wc -l` on the output tracks the run, and
             # so an interrupted read still leaves a usable partial manifest.
             if count % 2000 == 0:
                 fh.flush()
-    if tty:
-        print(" " * width, file=sys.stderr)
     print(f"Wrote {count} rows to {out}")
     return 0
 
@@ -712,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_listen)
 
     p = sub.add_parser("manifest", help="build a manifest from a published repo")
+    p.add_argument("--workers", type=int, default=16,
+                   help="parallel shard reads (default: 16; lower it if the "
+                        "hub starts rate-limiting)")
+    p.add_argument("--every", type=float, default=15.0,
+                   help="seconds between progress lines (default: 15)")
     p.add_argument("repo", help="HF dataset repo id")
     p.add_argument("-o", "--output", default="./segments.jsonl")
     p.set_defaults(func=cmd_manifest)

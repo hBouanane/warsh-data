@@ -361,7 +361,8 @@ def _read_shard(fs, path: str) -> List[Dict[str, Any]]:
 
 
 def read_rows(repo_id: str, token: Optional[str] = None, workers: int = 16,
-              on_progress: Optional[Callable[["ReadProgress"], None]] = None
+              on_progress: Optional[Callable[["ReadProgress"], None]] = None,
+              on_listed: Optional[Callable[[int], None]] = None
               ) -> Iterator[Dict[str, Any]]:
     """Yield every segment row from a repo's shards, without the audio.
 
@@ -377,6 +378,11 @@ def read_rows(repo_id: str, token: Optional[str] = None, workers: int = 16,
     ``on_progress`` is called once per shard with a :class:`ReadProgress`.  The
     shard total is known before the first read, so a caller can show real
     progress rather than a rising count with no end in sight.
+
+    ``on_listed`` is called with that total as soon as it is known.  Listing a
+    corpus takes seconds on its own -- longer unauthenticated -- and without it
+    the caller has nothing to say until the first shard lands, which reads as a
+    hang before any work has visibly begun.
     """
     import concurrent.futures as futures
 
@@ -384,6 +390,8 @@ def read_rows(repo_id: str, token: Optional[str] = None, workers: int = 16,
 
     fs = HfFileSystem(token=token)
     paths = sorted(fs.glob(f"datasets/{repo_id}/data/*/*.parquet"))
+    if on_listed is not None:
+        on_listed(len(paths))
 
     started = time.time()
     done = rows_seen = 0
