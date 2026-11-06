@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 __all__ = ["pick", "unlabelled", "by_reciter", "within", "reciters",
-           "fetch_clips", "build_page"]
+           "previous_ids", "fetch_clips", "build_page"]
 
 FIELDS = {"duration": "duration_seconds", "distance": "align_distance"}
 
@@ -90,6 +90,29 @@ def within(rows: Sequence[Dict[str, Any]], min_seconds: float = 0.0,
 
 def reciters(rows: Sequence[Dict[str, Any]]) -> List[str]:
     return sorted({r.get("reciter_slug") for r in rows if r.get("reciter_slug")})
+
+
+def previous_ids(rows: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    """Each segment's immediate predecessor in its own recording.
+
+    Needed for the commonest repair a short segment wants: a sub-second clip is
+    usually the tail of the phrase before it, cut off at a breath the segmenter
+    mistook for a stop, and it belongs merged back into that phrase.  A merge
+    names the segment that survives, so the button has to know what came
+    before -- and it must come from the whole manifest, not the handful of rows
+    on the page, because the predecessor is almost never itself an extreme.
+    """
+    by_source: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for row in rows:
+        if row.get("source_id") and row.get("index") is not None:
+            by_source[row["source_id"]].append(row)
+
+    out: Dict[str, str] = {}
+    for group in by_source.values():
+        group.sort(key=lambda r: r["index"])
+        for earlier, later in zip(group, group[1:]):
+            out[later["segment_id"]] = earlier["segment_id"]
+    return out
 
 
 def unlabelled(rows, n: int):
@@ -178,7 +201,8 @@ def _arabic(kind: str, value) -> str:
             f'<span dir="rtl" lang="ar">{html.escape(value)}</span></div>')
 
 
-def _row_block(rank: int, row: Dict[str, Any], data: Optional[bytes]) -> str:
+def _row_block(rank: int, row: Dict[str, Any], data: Optional[bytes],
+               previous: Optional[str] = None) -> str:
     if data:
         encoded = base64.b64encode(data).decode("ascii")
         player = (f'<audio controls preload="none" '
@@ -186,13 +210,33 @@ def _row_block(rank: int, row: Dict[str, Any], data: Optional[bytes]) -> str:
     else:
         player = '<p class="missing">audio unavailable</p>'
 
+    segment_id = row["segment_id"]
+    start = row.get("start_seconds") or 0.0
+    end = row.get("end_seconds") or 0.0
+
+    # "Split here" reads the player's position, so the cut is the point the
+    # reviewer actually heard.  at_seconds is on the source timeline, hence the
+    # clip's own start is added back on.
+    merge = ""
+    if previous:
+        merge = (f'<button data-act="merge" title="absorb this into {previous}">'
+                 f'merge into previous</button>')
+    buttons = (f'<div class="acts" data-id="{html.escape(segment_id)}" '
+               f'data-start="{start:.3f}" data-end="{end:.3f}" '
+               f'data-prev="{html.escape(previous or "")}">'
+               f'<button data-act="drop">drop</button>'
+               f'{merge}'
+               f'<button data-act="split">split here</button>'
+               f'<span class="state"></span></div>')
+
     return (f'<section>'
             f'<h2><span class="rank">{rank}</span>'
-            f'{html.escape(row["segment_id"])}</h2>'
+            f'{html.escape(segment_id)}</h2>'
             f'<p class="meta">{html.escape(_facts(row))}</p>'
             f'{player}'
             f'{_arabic("heard", row.get("asr"))}'
             f'{_arabic("label", row.get("label"))}'
+            f'{buttons}'
             f'</section>')
 
 
@@ -218,11 +262,121 @@ _STYLE = """
   .text span[dir=rtl] { font-size: 1.35rem; line-height: 2.1; flex: 1; }
   .none { opacity: .45; font-style: italic; }
   .missing { color: #b45309; margin: .3rem 0 .6rem; }
+  .acts { display: flex; gap: .4rem; align-items: center; margin-top: .6rem;
+          flex-wrap: wrap; }
+  .acts button { font: inherit; font-size: .8rem; padding: .2rem .6rem;
+                 border: 1px solid rgba(128,128,128,.5); border-radius: 5px;
+                 background: transparent; color: inherit; cursor: pointer; }
+  .acts button:hover { border-color: currentColor; }
+  .acts button.on { background: #b45309; border-color: #b45309; color: #fff; }
+  .state { font-size: .78rem; opacity: .7; font-family: ui-monospace, monospace; }
+  #tray { position: fixed; right: 1rem; bottom: 1rem; z-index: 9;
+          background: Canvas; color: CanvasText; max-width: 22rem;
+          border: 1px solid rgba(128,128,128,.5); border-radius: 8px;
+          padding: .7rem .9rem; font-size: .82rem;
+          box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+  #tray[hidden] { display: none; }
+  #tray h4 { margin: 0 0 .4rem; font-size: .85rem; }
+  #tray ol { margin: 0 0 .6rem; padding-left: 1.2rem; max-height: 11rem;
+             overflow: auto; font-family: ui-monospace, monospace;
+             font-size: .74rem; }
+  #tray button { font: inherit; padding: .3rem .7rem; border-radius: 5px;
+                 border: 1px solid currentColor; background: transparent;
+                 color: inherit; cursor: pointer; }
+"""
+
+#: Collects corrections in the page and writes them out as corrections.jsonl,
+#: the format `warsh-data apply-corrections` already reads.  No server: the
+#: page is opened from a download, so the file is built with a Blob.
+#:
+#: Each correction carries orig_start_seconds / orig_end_seconds -- the
+#: boundaries actually listened to.  If segmentation is re-run with different
+#: thresholds the segment moves, and apply reports the correction as drifted
+#: rather than applying it to audio nobody reviewed.
+_SCRIPT = """
+const picked = new Map();
+
+function draw() {
+  const tray = document.getElementById('tray');
+  const list = document.getElementById('tray-list');
+  tray.hidden = picked.size === 0;
+  list.innerHTML = '';
+  for (const [id, c] of picked) {
+    const li = document.createElement('li');
+    li.textContent = c.action + ' ' + id.split('__').slice(-2).join('__');
+    list.appendChild(li);
+  }
+  document.getElementById('tray-count').textContent = picked.size;
+}
+
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('.acts button');
+  if (!button) return;
+  const box = button.closest('.acts');
+  const id = box.dataset.id;
+  const act = button.dataset.act;
+  const orig = {
+    orig_start_seconds: Number(box.dataset.start),
+    orig_end_seconds: Number(box.dataset.end),
+  };
+
+  // A second click on the active button clears the choice, so a misclick is
+  // undone in place rather than by reloading and starting over.
+  const already = picked.get(id);
+  if (already && already.action === act) {
+    picked.delete(id);
+  } else if (act === 'drop') {
+    picked.set(id, { segment_id: id, action: 'drop', note: 'reviewed by ear', ...orig });
+  } else if (act === 'merge') {
+    // The surviving record is the earlier one, which absorbs this segment --
+    // so the correction is written against the predecessor, not against this.
+    picked.set(id, { segment_id: box.dataset.prev, action: 'merge',
+                     with: [id], note: 'tail of the previous phrase' });
+  } else if (act === 'split') {
+    const audio = box.closest('section').querySelector('audio');
+    const at = Number(box.dataset.start) + (audio ? audio.currentTime : 0);
+    if (!audio || audio.currentTime <= 0.05) {
+      box.querySelector('.state').textContent =
+        'play to the cut point first, then press split';
+      return;
+    }
+    picked.set(id, { segment_id: id, action: 'split',
+                     at_seconds: [Number(at.toFixed(3))],
+                     note: 'waqf the segmenter missed', ...orig });
+  }
+
+  for (const other of box.querySelectorAll('button')) other.classList.remove('on');
+  const chosen = picked.get(id);
+  const chose_this = chosen && (chosen.action === act);
+  if (chose_this) button.classList.add('on');
+  box.querySelector('.state').textContent = chose_this
+    ? (chosen.action === 'split'
+        ? 'cut at ' + chosen.at_seconds[0].toFixed(2) + 's in the recording'
+        : chosen.action === 'merge'
+          ? 'into ' + chosen.segment_id.split('__').slice(-1)[0]
+          : 'will be dropped')
+    : '';
+  draw();
+});
+
+function save() {
+  const lines = [...picked.values()].map((c) => JSON.stringify(c)).join('
+');
+  const url = URL.createObjectURL(new Blob([lines + '
+'],
+                                           { type: 'application/x-ndjson' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'corrections.jsonl';
+  a.click();
+  URL.revokeObjectURL(url);
+}
 """
 
 
 def build_page(sections: Sequence[tuple], clips: Dict[str, bytes], out_path: Path,
-               title: str = "Segments worth hearing") -> Path:
+               title: str = "Segments worth hearing",
+               previous: Optional[Dict[str, str]] = None) -> Path:
     """One self-contained page.  ``sections`` is ``(heading, why, [row, ...])``.
 
     Audio is embedded as data URIs rather than linked: the page gets opened
@@ -233,8 +387,10 @@ def build_page(sections: Sequence[tuple], clips: Dict[str, bytes], out_path: Pat
     for heading, why, rows in sections:
         if not rows:
             continue
-        body = "".join(_row_block(i, row, clips.get(row["segment_id"]))
-                       for i, row in enumerate(rows, 1))
+        body = "".join(
+            _row_block(i, row, clips.get(row["segment_id"]),
+                       (previous or {}).get(row["segment_id"]))
+            for i, row in enumerate(rows, 1))
         blocks.append(f'<h3>{html.escape(heading)}'
                       f'<span class="why">{html.escape(why)}</span></h3>{body}')
 
@@ -245,7 +401,12 @@ def build_page(sections: Sequence[tuple], clips: Dict[str, bytes], out_path: Pat
             f'<p class="lede">"heard" is the bootstrap recogniser and is kept for '
             f'diagnosis only. "label" is the reference text the aligner chose, and '
             f'is what training would see — so the label is what you are '
-            f'judging.</p>\n{"".join(blocks)}\n</body>\n</html>\n')
+            f'judging. "match" is 1.00 when the two are identical.</p>\n'
+            f'{"".join(blocks)}\n'
+            f'<div id="tray" hidden><h4><span id="tray-count">0</span> '
+            f'correction(s)</h4><ol id="tray-list"></ol>'
+            f'<button onclick="save()">download corrections.jsonl</button></div>\n'
+            f'<script>{_SCRIPT}</script>\n</body>\n</html>\n')
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

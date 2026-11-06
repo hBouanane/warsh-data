@@ -558,6 +558,7 @@ def cmd_review(args: argparse.Namespace) -> int:
               f"--list-reciters shows what is there", file=sys.stderr)
         return 1
 
+    all_rows = rows
     rows = review.by_reciter(rows, args.reciter)
     scope = args.reciter or "all reciters"
     if args.min_seconds or args.max_seconds is not None:
@@ -610,7 +611,10 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"warning: {missing} segment(s) had no audio", file=sys.stderr)
 
     title = f"Segments worth hearing — {scope}"
-    page = review.build_page(sections, clips, Path(args.output), title=title)
+    # Built from every row, not the page's: a short segment's predecessor is
+    # almost never itself an extreme, so it would be absent from the sections.
+    page = review.build_page(sections, clips, Path(args.output), title=title,
+                             previous=review.previous_ids(all_rows))
     for heading, _, chosen in sections:
         if not chosen:
             continue

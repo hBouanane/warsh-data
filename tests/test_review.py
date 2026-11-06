@@ -224,3 +224,48 @@ def test_worst_matched_excludes_rows_with_nothing_to_compare():
     # They are not lost -- they are what the unlabelled section is for.
     assert {r["segment_id"] for r in review.unlabelled(rows, 10)} == {
         "untranscribed", "no-label"}
+
+
+def test_previous_ids_chain_within_a_recording():
+    """A merge names the segment that survives, so the button needs the
+    predecessor -- and ordering must come from `index`, not from the order rows
+    happen to appear, and must never cross into another recording."""
+    rows = [
+        {"segment_id": "a__001__0002", "source_id": "a/001", "index": 2},
+        {"segment_id": "a__001__0000", "source_id": "a/001", "index": 0},
+        {"segment_id": "a__001__0001", "source_id": "a/001", "index": 1},
+        {"segment_id": "a__002__0000", "source_id": "a/002", "index": 0},
+    ]
+    prev = review.previous_ids(rows)
+    assert prev["a__001__0001"] == "a__001__0000"
+    assert prev["a__001__0002"] == "a__001__0001"
+    assert "a__001__0000" not in prev, "the first segment has no predecessor"
+    assert "a__002__0000" not in prev, "merges must not cross recordings"
+
+
+def test_page_offers_the_repairs_the_corrections_format_accepts(tmp_path):
+    rows = [row("a__001__0007", 44.0, 0.9)]
+    rows[0].update(source_id="a/001", index=7, start_seconds=120.0,
+                   end_seconds=164.0)
+    page = review.build_page(
+        [("Longest", "why", rows)], {"a__001__0007": b"fLaC"},
+        tmp_path / "r.html", previous={"a__001__0007": "a__001__0006"})
+    text = page.read_text(encoding="utf-8")
+
+    for action in ("drop", "merge", "split"):
+        assert f'data-act="{action}"' in text, action
+    # The clip's own start, so a split point lands on the source timeline.
+    assert 'data-start="120.000"' in text
+    assert 'data-prev="a__001__0006"' in text
+    assert "corrections.jsonl" in text
+
+
+def test_a_first_segment_is_offered_no_merge(tmp_path):
+    """There is nothing before it to merge into, and a button writing a
+    correction against an empty segment_id would be silently unapplicable."""
+    page = review.build_page(
+        [("Shortest", "why", [row("a__001__0000", 0.5, 0.2)])], {},
+        tmp_path / "r.html", previous={})
+    text = page.read_text(encoding="utf-8")
+    assert 'data-act="drop"' in text
+    assert 'data-act="merge"' not in text

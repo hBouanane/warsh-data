@@ -8,6 +8,7 @@ import json
 import pytest
 from conftest import make_record
 
+from warshdata import corrections
 from warshdata.corrections import Correction, apply, read_corrections
 from warshdata.corrections import _suffix
 
@@ -158,3 +159,67 @@ def test_read_corrections_accepts_with_alias(tmp_path):
     cors = read_corrections(path)
     assert [c.segment_id for c in cors] == ["a", "c"]
     assert cors[0].with_ids == ["b"]
+
+
+def test_the_review_page_emits_corrections_this_module_can_apply(tmp_path):
+    """Contract test across a language boundary.
+
+    The review page builds corrections.jsonl in JavaScript and this module
+    reads it in Python. Nothing else checks that the two agree, so a renamed
+    key on either side would only surface as corrections that silently apply
+    to nothing. These are the exact shapes review.py's script writes.
+    """
+    import json
+
+    records = [
+        {"segment_id": "r__001__0000", "source_id": "r/001", "index": 0,
+         "start_seconds": 0.0, "end_seconds": 10.0, "duration_seconds": 10.0,
+         "start_sample": 0, "end_sample": 160000, "sample_rate": 16000},
+        {"segment_id": "r__001__0001", "source_id": "r/001", "index": 1,
+         "start_seconds": 10.0, "end_seconds": 10.6, "duration_seconds": 0.6,
+         "start_sample": 160000, "end_sample": 169600, "sample_rate": 16000},
+        {"segment_id": "r__001__0002", "source_id": "r/001", "index": 2,
+         "start_seconds": 10.6, "end_seconds": 55.6, "duration_seconds": 45.0,
+         "start_sample": 169600, "end_sample": 889600, "sample_rate": 16000},
+        {"segment_id": "r__001__0003", "source_id": "r/001", "index": 3,
+         "start_seconds": 55.6, "end_seconds": 58.0, "duration_seconds": 2.4,
+         "start_sample": 889600, "end_sample": 928000, "sample_rate": 16000},
+    ]
+
+    written = [
+        # "merge into previous" on 0001: written against its predecessor, which
+        # is the record that survives and absorbs the short tail.
+        {"segment_id": "r__001__0000", "action": "merge",
+         "with": ["r__001__0001"], "note": "tail of the previous phrase"},
+        # "split here" on 0002, cut at the player position plus the clip start.
+        {"segment_id": "r__001__0002", "action": "split",
+         "at_seconds": [32.5], "note": "waqf the segmenter missed",
+         "orig_start_seconds": 10.6, "orig_end_seconds": 55.6},
+        {"segment_id": "r__001__0003", "action": "drop",
+         "note": "reviewed by ear",
+         "orig_start_seconds": 55.6, "orig_end_seconds": 58.0},
+    ]
+    path = tmp_path / "corrections.jsonl"
+    path.write_text("\n".join(json.dumps(c) for c in written) + "\n",
+                    encoding="utf-8")
+
+    parsed = corrections.read_corrections(path)
+    assert [c.action for c in parsed] == ["merge", "split", "drop"]
+    assert parsed[0].with_ids == ["r__001__0001"], "the page writes 'with'"
+
+    final, report = corrections.apply(records, parsed)
+    assert report.invalid == [], report.invalid
+    assert report.drifted == [], report.drifted
+    assert report.unmatched == [], report.unmatched
+    assert report.merged_away == 1 and report.dropped == 1
+
+    ids = [r["segment_id"] for r in final]
+    # The merged pair survives under the earlier id, spanning both.
+    assert "r__001__0000" in ids and "r__001__0001" not in ids
+    merged = next(r for r in final if r["segment_id"] == "r__001__0000")
+    assert (merged["start_seconds"], merged["end_seconds"]) == (0.0, 10.6)
+    # The long one became two, and the dropped one is gone.
+    assert "r__001__0002_a" in ids and "r__001__0002_b" in ids
+    assert "r__001__0003" not in ids
+    first = next(r for r in final if r["segment_id"] == "r__001__0002_a")
+    assert (first["start_seconds"], first["end_seconds"]) == (10.6, 32.5)
