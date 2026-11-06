@@ -539,7 +539,7 @@ def cmd_listen(args: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    """Pull the extremes of the corpus into one page and listen to them."""
+    """Pull chosen segments into one page and listen to them."""
     from . import review
 
     rows = list(manifest.read(Path(args.manifest)))
@@ -547,42 +547,83 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"No rows in {args.manifest}", file=sys.stderr)
         return 1
 
-    sections = [
-        ("Longest segments",
-         "the segmenter missed every stop inside these; past 30 s nothing was "
-         "transcribed or labelled at all",
-         review.pick(rows, "duration", args.count, largest=True)),
-        ("Shortest segments",
-         "under 0.5 s nothing was transcribed either, and a sub-second segment "
-         "is usually a breath or a click rather than speech",
-         review.pick(rows, "duration", args.count, largest=False)),
-        ("Worst aligned",
-         "either a genuinely misplaced span or a voice the recogniser struggled "
-         "with -- read the label against what you hear to tell which",
-         review.pick(rows, "distance", args.count, largest=True)),
-        ("No label at all",
-         "nothing was transcribed, so nothing could be aligned -- almost always "
-         "a clip past the 30 s window, i.e. a missed waqf",
-         review.unlabelled(rows, args.count)),
-    ]
+    if args.list_reciters:
+        for slug in review.reciters(rows):
+            n = sum(1 for r in rows if r.get("reciter_slug") == slug)
+            print(f"  {slug:<30}{n:>8} segments")
+        return 0
 
-    wanted = {r["segment_id"]: r for rows_ in sections for r in rows_[2]}
+    if args.reciter and args.reciter not in review.reciters(rows):
+        print(f"No reciter {args.reciter!r} in {args.manifest}; "
+              f"--list-reciters shows what is there", file=sys.stderr)
+        return 1
+
+    rows = review.by_reciter(rows, args.reciter)
+    scope = args.reciter or "all reciters"
+    if args.min_seconds or args.max_seconds is not None:
+        before = len(rows)
+        rows = review.within(rows, args.min_seconds, args.max_seconds)
+        print(f"{scope}: {len(rows)} of {before} segments inside the "
+              f"duration window")
+    if not rows:
+        print("Nothing left after filtering.", file=sys.stderr)
+        return 1
+
+    wanted_sections = (args.sections.split(",") if args.sections
+                       else ["long", "short", "worst", "nolabel"])
+    unknown = [name for name in wanted_sections
+               if name not in {"long", "short", "worst", "nolabel"}]
+    if unknown:
+        print(f"Unknown section(s): {', '.join(unknown)}", file=sys.stderr)
+        return 1
+
+    available = {
+        "long": ("Longest segments",
+                 "the segmenter missed every stop inside these; past 30 s "
+                 "nothing was transcribed or labelled at all",
+                 lambda: review.pick(rows, "duration", args.count, largest=True)),
+        "short": ("Shortest segments",
+                  "usually the tail of the previous phrase, which belongs "
+                  "merged back into it rather than standing alone",
+                  lambda: review.pick(rows, "duration", args.count, largest=False)),
+        "worst": ("Worst matched",
+                  "either a genuinely misplaced span or a voice the recogniser "
+                  "struggled with -- read the label against what you hear",
+                  lambda: review.pick(rows, "distance", args.count, largest=True)),
+        "nolabel": ("No label at all",
+                    "nothing was transcribed, so nothing could be aligned -- "
+                    "almost always a clip past the 30 s window",
+                    lambda: review.unlabelled(rows, args.count)),
+    }
+    sections = [(h, why, build()) for name in wanted_sections
+                for h, why, build in [available[name]]]
+
+    wanted = {r["segment_id"]: r for _, _, chosen in sections for r in chosen}
+    if not wanted:
+        print("Nothing to review.", file=sys.stderr)
+        return 1
+
     print(f"Fetching audio for {len(wanted)} segment(s) from {args.repo} ...")
     clips = review.fetch_clips(args.repo, list(wanted.values()), workers=args.workers)
-
     missing = len(wanted) - len(clips)
     if missing:
         print(f"warning: {missing} segment(s) had no audio", file=sys.stderr)
 
-    page = review.build_page(sections, clips, Path(args.output))
-    size = page.stat().st_size / 1e6
+    title = f"Segments worth hearing — {scope}"
+    page = review.build_page(sections, clips, Path(args.output), title=title)
     for heading, _, chosen in sections:
-        if chosen:
-            field = "duration_seconds" if "aligned" not in heading else "align_distance"
-            lo, hi = chosen[-1].get(field), chosen[0].get(field)
-            print(f"  {heading}: {len(chosen)} ({hi:.3g} down to {lo:.3g})")
+        if not chosen:
+            continue
+        if "matched" in heading:
+            lo = 1.0 - (chosen[0].get("align_distance") or 0)
+            hi = 1.0 - (chosen[-1].get("align_distance") or 0)
+            print(f"  {heading}: {len(chosen)} (match {lo:.3f} up to {hi:.3f})")
+        else:
+            a = chosen[0].get("duration_seconds") or 0
+            b = chosen[-1].get("duration_seconds") or 0
+            print(f"  {heading}: {len(chosen)} ({a:.1f}s to {b:.1f}s)")
     print("")
-    print(f"Wrote {page} ({size:.1f} MB, self-contained)")
+    print(f"Wrote {page} ({page.stat().st_size / 1e6:.1f} MB, self-contained)")
     return 0
 
 
@@ -601,15 +642,17 @@ def cmd_quality(args: argparse.Namespace) -> int:
 
     print(f"{len(rows)} segments, {len(labels)} reciter(s)")
     print("")
-    print("How far the label sits from what the recogniser heard")
-    print("  distance is normalised Levenshtein on skeletons -- consonants only,")
-    print("  diacritics stripped on both sides, so it says nothing about those")
+    print("How well the label matches what the recogniser heard")
+    print("  match = 1.00 identical, 0.00 nothing in common. Compared on")
+    print("  skeletons -- consonants only, diacritics stripped on both sides,")
+    print("  so this says nothing about diacritics")
+    print("  the bad tail is the LOW end, hence p10 and p01")
     print("")
     print(format_label_table(labels))
     print("")
-    print("  scored = segments with both a transcript and a distance; the rest")
-    print("           are excluded above, since an empty transcript scores 1.0")
-    print("           against a real span and is an absent measurement, not a bad one")
+    print("  scored = segments with both a transcript and a score; the rest are")
+    print("           excluded above, since an empty transcript matches nothing")
+    print("           and that is an absent measurement, not a bad one")
     print("  short  = label holds 2+ more words than the transcript")
     print("  notx   = never transcribed (clip outside the 0.5-30 s window)")
     print("  nolab  = no label at all")
@@ -627,6 +670,51 @@ def cmd_quality(args: argparse.Namespace) -> int:
         print("Worth acting on:")
         for note in notes:
             print(f"  {note}")
+    return 0
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    """Download a corpus's shards locally, per reciter."""
+    from .pull import pull_shards, summarise
+
+    reciters = [r.strip() for r in args.reciter.split(",")] if args.reciter else None
+    dest = Path(args.output)
+
+    def each(item, done, total) -> None:
+        if done == 1 or done == total or done % args.every == 0:
+            print(f"  {done}/{total}  {item.reciter}/{item.surah}"
+                  f"  {item.bytes / 1e6:.1f} MB", flush=True)
+
+    print(f"Pulling {args.repo} -> {dest}" +
+          (f" (reciters: {', '.join(reciters)})" if reciters else " (all reciters)"))
+    pulled = pull_shards(args.repo, dest, reciters, workers=args.workers,
+                         on_each=each)
+    if not pulled:
+        print("Nothing downloaded.", file=sys.stderr)
+        return 1
+    print("")
+    print(summarise(pulled))
+    print("")
+    print(f"Build a manifest from it with:  warsh-data local-manifest {dest}")
+    return 0
+
+
+def cmd_local_manifest(args: argparse.Namespace) -> int:
+    """Build a manifest from a local tree, at disk speed."""
+    from .pull import local_rows
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    reciters = [r.strip() for r in args.reciter.split(",")] if args.reciter else None
+    count = 0
+    with out.open("w", encoding="utf-8") as fh:
+        for row in local_rows(Path(args.root), reciters):
+            fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
+            count += 1
+    if not count:
+        print(f"No shards under {args.root}/data/*/*.parquet", file=sys.stderr)
+        return 1
+    print(f"Wrote {count} rows to {out}")
     return 0
 
 
@@ -717,15 +805,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default="./segments.jsonl")
     p.set_defaults(func=cmd_manifest)
 
-    p = sub.add_parser("review", help="listen to the extremes of a published corpus")
+    p = sub.add_parser("review", help="listen to chosen segments of a corpus")
     p.add_argument("repo", help="dataset repo the segments were published to")
     p.add_argument("--manifest", default="full.jsonl",
                    help="manifest to choose from (default: full.jsonl)")
+    p.add_argument("--reciter", help="only this reciter, evaluated on their own")
+    p.add_argument("--list-reciters", action="store_true",
+                   help="print the reciters in the manifest and exit")
+    p.add_argument("--sections", help="comma-separated: long,short,worst,nolabel "
+                                      "(default: all four)")
+    p.add_argument("--min-seconds", type=float, default=0.0,
+                   help="ignore segments shorter than this")
+    p.add_argument("--max-seconds", type=float,
+                   help="ignore segments longer than this")
     p.add_argument("-n", "--count", type=int, default=10,
                    help="segments per section (default: 10)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("-o", "--output", default="out/review.html")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("pull", help="download a corpus's shards locally")
+    p.add_argument("repo", help="HF dataset repo id")
+    p.add_argument("--reciter", help="comma-separated slugs; omit for all")
+    p.add_argument("-o", "--output", default="corpus",
+                   help="local root, keeping the repo layout (default: corpus)")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--every", type=int, default=25,
+                   help="shards between progress lines (default: 25)")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("local-manifest",
+                       help="build a manifest from a pulled tree, at disk speed")
+    p.add_argument("root", nargs="?", default="corpus")
+    p.add_argument("--reciter", help="comma-separated slugs; omit for all")
+    p.add_argument("-o", "--output", default="local.jsonl")
+    p.set_defaults(func=cmd_local_manifest)
 
     p = sub.add_parser("quality", help="per-reciter label fit and waqf fit")
     p.add_argument("manifest", nargs="?", default="full.jsonl",

@@ -43,9 +43,10 @@ def test_untranscribed_clips_do_not_count_as_misalignment():
 
     fit = quality.label_fit(rows)[0]
     assert fit.scored == 90, "untranscribed rows must not be scored"
-    assert fit.mean == 0.02, f"mean polluted by empty transcripts: {fit.mean}"
-    assert fit.p99 < 0.1
-    assert fit.over_050 == 0.0
+    # Reported as match = 1 - distance, so a 0.02 distance is a 0.98 match.
+    assert fit.mean == 0.98, f"mean polluted by empty transcripts: {fit.mean}"
+    assert fit.p01 > 0.9, "the bad tail is the low end once this is a match"
+    assert fit.under_050 == 0.0
 
     # Not hidden, though -- just counted as what it is.
     assert fit.no_transcript == 0.10
@@ -53,10 +54,11 @@ def test_untranscribed_clips_do_not_count_as_misalignment():
     assert fit.segments == 100
 
 
-def test_reciters_are_ordered_by_mean_distance():
+def test_reciters_are_ordered_worst_match_first():
     rows = ([row("clean", distance=0.01)] * 10
             + [row("noisy", distance=0.30)] * 10
             + [row("middling", distance=0.08)] * 10)
+    # Worst first, which with a match means lowest first.
     assert [f.reciter for f in quality.label_fit(rows)] == [
         "noisy", "middling", "clean"]
 

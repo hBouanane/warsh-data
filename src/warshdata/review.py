@@ -25,7 +25,8 @@ import html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-__all__ = ["pick", "unlabelled", "fetch_clips", "build_page"]
+__all__ = ["pick", "unlabelled", "by_reciter", "within", "reciters",
+           "fetch_clips", "build_page"]
 
 FIELDS = {"duration": "duration_seconds", "distance": "align_distance"}
 
@@ -38,11 +39,57 @@ def pick(rows: Sequence[Dict[str, Any]], by: str, n: int,
     with no distance was never aligned at all, which is its own category and
     not the worst-aligned one.  Sorting those in as zeros would fill the
     shortest-first list with rows that have nothing to do with duration.
+
+    By distance, rows lacking a transcript or a label are dropped too -- see
+    the comment below for why they used to dominate the list while being
+    indistinguishable from a perfect match on screen.
     """
     field = FIELDS[by]
     scored = [r for r in rows if r.get(field) is not None]
+    if by == "distance":
+        # A clip outside the recogniser's window is never transcribed, and the
+        # aligner then scores an empty hypothesis against a real span: 1.0,
+        # the top of the list. Those rows have no transcript and no label, so
+        # the page printed "none" against "none" -- which reads as the two
+        # being identical, with the worst possible score next to it. They are
+        # an absent measurement, not a bad one, and belong in unlabelled().
+        scored = [r for r in scored if r.get("asr") and r.get("label")]
     scored.sort(key=lambda r: r[field], reverse=largest)
     return scored[:n]
+
+
+def by_reciter(rows: Sequence[Dict[str, Any]], reciter: Optional[str]
+               ) -> List[Dict[str, Any]]:
+    """Only ``reciter``'s rows, or all of them when it is None.
+
+    Reciters are evaluated one at a time because the repair is per reciter:
+    segmentation thresholds that suit a fast voice cut a slow one mid-phrase,
+    and a corpus-wide list of the longest segments is just the slowest reciter
+    thirty times over, which says nothing about anyone else.
+    """
+    if not reciter:
+        return list(rows)
+    return [r for r in rows if r.get("reciter_slug") == reciter]
+
+
+def within(rows: Sequence[Dict[str, Any]], min_seconds: float = 0.0,
+           max_seconds: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Rows whose duration falls in the window, bounds included."""
+    out = []
+    for row in rows:
+        seconds = row.get("duration_seconds")
+        if seconds is None:
+            continue
+        if seconds < min_seconds:
+            continue
+        if max_seconds is not None and seconds > max_seconds:
+            continue
+        out.append(row)
+    return out
+
+
+def reciters(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    return sorted({r.get("reciter_slug") for r in rows if r.get("reciter_slug")})
 
 
 def unlabelled(rows, n: int):
@@ -106,7 +153,9 @@ def _fmt(seconds: float) -> str:
 def _facts(row: Dict[str, Any]) -> str:
     out = [_fmt(row.get("duration_seconds") or 0)]
     if row.get("align_distance") is not None:
-        out.append(f"distance {row['align_distance']:.3f}")
+        # Shown as a similarity: the stored field is a distance, where 0 means
+        # identical, and that reads backwards to every human who sees it.
+        out.append(f"match {1.0 - row['align_distance']:.3f}")
     if row.get("ayah_start") is not None:
         span = str(row["ayah_start"])
         if row.get("ayah_end") not in (None, row.get("ayah_start")):

@@ -1,13 +1,22 @@
 """Per-reciter corpus health, as two separate questions.
 
-*How far is the label from what was heard?*  ``align_distance`` is a normalised
-Levenshtein between the skeleton of the ASR transcript and the skeleton of the
-chosen reference span -- consonants only, diacritics stripped on both sides.  A
-high value is one of two opposite things: a genuinely misplaced span, or a
-voice the bootstrap recogniser found hard while the span is perfectly correct.
-The mean cannot tell them apart, but the shape can.  A heavy tail with a normal
-median is a handful of bad segments in good audio; a lifted median is the whole
-reciter being off, which is the signature worth chasing.
+*How well does the label match what was heard?*  The manifest stores
+``align_distance``, a normalised Levenshtein between the skeleton of the ASR
+transcript and the skeleton of the chosen reference span -- consonants only,
+diacritics stripped on both sides.  Being a distance, 0 there means identical,
+which reads backwards to everyone including its author.  So every figure here
+is reported as ``match = 1 - distance``: 1.00 is a perfect match, 0.00 is
+nothing in common.  The stored field keeps its own meaning, because 141k
+published rows already carry it.
+
+Reporting a similarity flips which tail matters.  The segments worth finding
+are now the *low* ones, so the quantiles are p10 and p01 rather than p90 and
+p99.  A
+low match is one of two opposite things: a genuinely misplaced span, or a voice
+the bootstrap recogniser found hard while the span is perfectly correct.  The
+mean cannot tell them apart, but the shape can.  A heavy low tail with a normal
+median is a handful of bad segments in good audio; a *depressed* median is the
+whole reciter being off, which is the signature worth chasing.
 
 The word-count column separates a third cause.  When the label carries
 materially more words than the recogniser produced, the transcript is short --
@@ -66,12 +75,14 @@ class LabelFit:
     #: Segments with both a transcript and a distance, i.e. the ones these
     #: numbers actually describe.
     scored: int
+    #: All as match = 1 - distance, so 1.00 is identical.
     mean: float
     p50: float
-    p90: float
-    p99: float
-    over_035: float
-    over_050: float
+    #: The bad tail: a tenth and a hundredth of segments match worse than these.
+    p10: float
+    p01: float
+    under_065: float
+    under_050: float
     #: Share whose label holds >= SHORT_BY_WORDS more words than the transcript.
     transcript_short: float
     #: Share never transcribed -- clips outside the recogniser's duration
@@ -99,7 +110,7 @@ def label_fit(rows: Sequence[Dict[str, Any]]) -> List[LabelFit]:
 
     out = []
     for reciter, group in by.items():
-        scored = [r["align_distance"] for r in group
+        scored = [1.0 - r["align_distance"] for r in group
                   if r.get("align_distance") is not None and r.get("asr")]
         short = 0
         comparable = 0
@@ -117,16 +128,16 @@ def label_fit(rows: Sequence[Dict[str, Any]]) -> List[LabelFit]:
             scored=len(scored),
             mean=sum(scored) / len(scored) if scored else 0.0,
             p50=_quantile(scored, 0.50),
-            p90=_quantile(scored, 0.90),
-            p99=_quantile(scored, 0.99),
-            over_035=_share(sum(1 for d in scored if d >= 0.35), len(scored)),
-            over_050=_share(sum(1 for d in scored if d >= 0.50), len(scored)),
+            p10=_quantile(scored, 0.10),
+            p01=_quantile(scored, 0.01),
+            under_065=_share(sum(1 for m in scored if m <= 0.65), len(scored)),
+            under_050=_share(sum(1 for m in scored if m <= 0.50), len(scored)),
             transcript_short=_share(short, comparable),
             no_transcript=_share(sum(1 for r in group if not r.get("asr")),
                                  len(group)),
             no_label=_share(sum(1 for r in group if not r.get("label")), len(group)),
         ))
-    return sorted(out, key=lambda f: -f.mean)
+    return sorted(out, key=lambda f: f.mean)
 
 
 @dataclass
@@ -176,14 +187,14 @@ def waqf_fit(rows: Sequence[Dict[str, Any]]) -> List[WaqfFit]:
 
 
 def format_label_table(fits: Sequence[LabelFit]) -> str:
-    head = (f"{'reciter':<28}{'scored':>7}{'mean':>7}{'p50':>7}{'p90':>7}"
-            f"{'p99':>7}{'>=.35':>7}{'>=.50':>7}{'short':>7}{'notx':>7}"
+    head = (f"{'reciter':<28}{'scored':>7}{'mean':>7}{'p50':>7}{'p10':>7}"
+            f"{'p01':>7}{'<=.65':>7}{'<=.50':>7}{'short':>7}{'notx':>7}"
             f"{'nolab':>7}")
     lines = [head, "-" * len(head)]
     for f in fits:
         lines.append(
             f"{f.reciter:<28}{f.scored:>7}{f.mean:>7.3f}{f.p50:>7.3f}"
-            f"{f.p90:>7.3f}{f.p99:>7.3f}{f.over_035:>6.1%}{f.over_050:>7.1%}"
+            f"{f.p10:>7.3f}{f.p01:>7.3f}{f.under_065:>6.1%}{f.under_050:>7.1%}"
             f"{f.transcript_short:>7.1%}{f.no_transcript:>7.1%}"
             f"{f.no_label:>7.1%}")
     return "\n".join(lines)
@@ -212,14 +223,16 @@ def verdicts(labels: Sequence[LabelFit], waqf: Sequence[WaqfFit],
     notes = []
     means = sorted(f.mean for f in labels)
     middle = median_mean if median_mean is not None else _quantile(means, 0.50)
+    middle_p50 = _quantile([g.p50 for g in labels], 0.50)
 
     for f in labels:
-        if middle and f.mean >= 2.0 * middle and f.p50 >= 1.5 * _quantile(
-                [g.p50 for g in labels], 0.50):
+        # Measured as a shortfall from the corpus, since "bad" is now low.
+        if middle and (1 - f.mean) >= 2.0 * (1 - middle) and                 (1 - f.p50) >= 1.5 * (1 - middle_p50):
             notes.append(
-                f"{f.reciter}: mean {f.mean:.3f} and median {f.p50:.3f} both well "
-                f"above the corpus -- a lifted median is the whole reciter being "
-                f"off, not a few bad segments; check the reading is really Warsh")
+                f"{f.reciter}: mean match {f.mean:.3f} and median {f.p50:.3f} "
+                f"both well below the corpus -- a depressed median is the whole "
+                f"reciter being off, not a few bad segments; check the reading "
+                f"is really Warsh")
         elif f.transcript_short >= 0.10:
             notes.append(
                 f"{f.reciter}: {f.transcript_short:.0%} of labels hold "

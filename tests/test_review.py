@@ -69,7 +69,9 @@ def test_page_is_self_contained_and_shows_both_texts(tmp_path):
     assert 'dir="rtl"' in text, "Arabic must render right to left"
     assert "قل هو الله احد" in text, "what the recogniser heard"
     assert "أَحَدٌ" in text, "the label, which is what training would see"
-    assert "distance 0.620" in text
+    # Shown as a similarity: 1 - 0.62. A stored distance of 0 means
+    # identical, which reads backwards to everyone who sees it.
+    assert "match 0.380" in text
     assert "ayah 2255-2256" in text
 
 
@@ -173,3 +175,52 @@ def test_unlabelled_picks_missing_labels_longest_first():
     got = review.unlabelled(rows, 10)
     assert [r["segment_id"] for r in got] == ["long", "mid", "empty-label"]
     assert review.unlabelled([row("ok", 5.0)], 10) == []
+
+
+def test_reciter_filter_isolates_one_voice():
+    """Segmentation thresholds are a per-reciter property: what suits a fast
+    voice cuts a slow one mid-phrase. A corpus-wide list of the longest
+    segments is just the slowest reciter over and over, which says nothing
+    about anyone else -- so each is evaluated alone."""
+    rows = [row("a1", 60.0) | {"reciter_slug": "slow"},
+            row("a2", 55.0) | {"reciter_slug": "slow"},
+            row("b1", 8.0) | {"reciter_slug": "fast"}]
+
+    assert review.reciters(rows) == ["fast", "slow"]
+    assert len(review.by_reciter(rows, "slow")) == 2
+    assert [r["segment_id"] for r in review.by_reciter(rows, "fast")] == ["b1"]
+    # No reciter named is every reciter, not none.
+    assert len(review.by_reciter(rows, None)) == 3
+
+
+def test_duration_window_includes_its_bounds():
+    rows = [row(f"s{i}", float(i)) for i in (1, 5, 10, 30, 70)]
+    assert [r["duration_seconds"] for r in review.within(rows, 5, 30)] == [5, 10, 30]
+    assert [r["duration_seconds"] for r in review.within(rows, 60)] == [70]
+    assert [r["duration_seconds"] for r in
+            review.within(rows, max_seconds=5)] == [1, 5]
+
+
+def test_rows_without_a_duration_drop_out_of_the_window():
+    rows = [row("ok", 10.0), {"segment_id": "none", "duration_seconds": None}]
+    assert [r["segment_id"] for r in review.within(rows, 0, 100)] == ["ok"]
+
+
+def test_worst_matched_excludes_rows_with_nothing_to_compare():
+    """The bug the user found on the page. An untranscribed clip scores 1.0 --
+    an empty hypothesis against a real span -- so it topped the worst-matched
+    list. But it has no transcript and no label, so the page printed "none"
+    against "none": the two looked *identical* while carrying the worst
+    possible score. An absent measurement, not a bad one.
+    """
+    rows = [row("real-mismatch", 8.0, 0.44),
+            row("untranscribed", 34.0, 1.0, asr=None, label=None),
+            row("no-label", 31.0, 1.0, label=None),
+            row("fine", 7.0, 0.01)]
+
+    worst = review.pick(rows, "distance", 10)
+    assert [r["segment_id"] for r in worst] == ["real-mismatch", "fine"]
+
+    # They are not lost -- they are what the unlabelled section is for.
+    assert {r["segment_id"] for r in review.unlabelled(rows, 10)} == {
+        "untranscribed", "no-label"}
